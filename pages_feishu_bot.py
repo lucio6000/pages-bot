@@ -198,34 +198,94 @@ def classify_page_status(http_status: int, payload: Optional[Dict[str, Any]], ha
 
     return "UNKNOWN", -1
 
-def probe_page(session: requests.Session, page_id: str, graph_version: str, access_token: Optional[str], timeout: int, probe_feed: bool) -> Dict[str, Any]:
+def probe_page(session: requests.Session, page_id: str, graph_version: str,
+               access_token: Optional[str], timeout: int, probe_feed: bool) -> Dict[str, Any]:
+    """
+    读取 Page 基础字段；再读 /settings 拿年龄/国家墙。
+    若用 System User Token 访问 /settings 返回 #200，则自动用 SU 换 Page Token 再试一次。
+    """
     had_token = bool(access_token)
     base = f"https://graph.facebook.com/{graph_version}/{page_id}"
-    params = {
-        "fields": "id,name,link,is_published,verification_status,fan_count,age_restrictions,country_restrictions,is_unclaimed,is_permanently_closed"
-    }
-    if had_token: params["access_token"] = access_token
+
+    # 1) 基础字段（注意已去掉 age_restrictions/country_restrictions）
+    params = {"fields": "id,name,link,is_published"}
+    if had_token:
+        params["access_token"] = access_token
 
     try:
         resp = session.get(base, params=params, timeout=timeout)
-        data = None
         try:
             data = resp.json()
         except Exception:
-            pass
+            data = None
 
+        # 2) 读 settings（AGE_/COUNTRY_），必要时回退用 Page Token
+        age_rest = None
+        country_rest = None
+        settings_perm_err = False
+
+        def _read_settings(token: Optional[str]) -> Tuple[Optional[str], Optional[str], int, Optional[str]]:
+            sparams = {"fields": "setting,value"}
+            if token:
+                sparams["access_token"] = token
+            r = session.get(f"{base}/settings", params=sparams, timeout=timeout)
+            try:
+                js = r.json()
+            except Exception:
+                js = None
+            ar = cr = None
+            if r.status_code == 200 and isinstance(js, dict):
+                for it in (js.get("data") or []):
+                    if it.get("setting") == "AGE_RESTRICTIONS":
+                        ar = it.get("value")
+                    elif it.get("setting") == "COUNTRY_RESTRICTIONS":
+                        cr = it.get("value")
+            emsg = (js or {}).get("error", {}).get("message") if isinstance(js, dict) else None
+            return ar, cr, r.status_code, emsg
+
+        if had_token:
+            ar, cr, sc, em = _read_settings(access_token)
+            if sc == 200:
+                age_rest, country_rest = ar, cr
+            elif em and "Insufficient administrative permission" in em:
+                # 用 SU token 换 Page token 再读一次
+                r2 = session.get(base, params={"fields": "access_token", "access_token": access_token}, timeout=timeout)
+                js2 = r2.json() if "application/json" in (r2.headers.get("content-type") or "") else {}
+                ptoken = (js2 or {}).get("access_token")
+                if ptoken:
+                    ar2, cr2, sc2, _ = _read_settings(ptoken)
+                    if sc2 == 200:
+                        age_rest, country_rest = ar2, cr2
+                    else:
+                        settings_perm_err = True
+                else:
+                    settings_perm_err = True
+
+        # 3) 判定（尽量只对“确定异常”给 ❌）
         status, normal_flag = classify_page_status(resp.status_code, data, had_token, CONFIG["FB"]["NEED_TOKEN_AS_NORMAL"])
+        if resp.status_code == 200 and isinstance(data, dict) and data.get("id"):
+            is_published = data.get("is_published")
+            if is_published is False:
+                status, normal_flag = "UNPUBLISHED", 0
+            elif age_rest and str(age_rest).strip().lower() not in ("", "13+"):
+                status, normal_flag = "RESTRICTED_AGE", 0
+            elif country_rest and str(country_rest).strip() not in ("", "None"):
+                status, normal_flag = "RESTRICTED_COUNTRY", 0
+            else:
+                # 若 /settings 权限被挡，给出提示但不当作“确定异常”
+                status = "OK" if normal_flag == 1 else status
 
-        # 可选：feed 探针做侧写（仅在尚未确定异常时再探）
+        # 4) 可选：feed 探针侧写（保留你原来的行为）
         feed_hint = None
         if probe_feed and status in ("OK", "NEED_TOKEN", "AUTH_ERROR", "UNKNOWN", "RATE_LIMIT"):
             try:
                 feed_params = {"limit": 1}
-                if had_token: feed_params["access_token"] = access_token
-                r2 = session.get(f"{base}/feed", params=feed_params, timeout=timeout)
-                d2 = r2.json() if "application/json" in (r2.headers.get("content-type") or "") else None
-                if r2.status_code != 200:
-                    er = (d2 or {}).get("error") or {}
+                if had_token:
+                    feed_params["access_token"] = access_token
+                rfeed = session.get(f"{base}/feed", params=feed_params, timeout=timeout)
+                dfeed = rfeed.json() if "application/json" in (rfeed.headers.get("content-type") or "") else None
+                if rfeed.status_code != 200:
+                    er = (dfeed or {}).get("error") or {}
                     emsg = (er.get("message") or "").lower()
                     if any(k in emsg for k in ["permissions", "requires", "not authorized", "#10", "#200"]):
                         feed_hint = "FEED_PERMISSION_BLOCKED"
@@ -233,6 +293,8 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str, acce
                         feed_hint = "FEED_GEO_AGE_RESTRICTED"
             except Exception:
                 pass
+        if settings_perm_err and not feed_hint:
+            feed_hint = "SETTINGS_PERMISSION_BLOCKED"
 
         return {
             "page_id": page_id,
@@ -242,8 +304,8 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str, acce
             "name": (data or {}).get("name") if isinstance(data, dict) else None,
             "link": (data or {}).get("link") if isinstance(data, dict) else None,
             "is_published": (data or {}).get("is_published") if isinstance(data, dict) else None,
-            "age_restrictions": (data or {}).get("age_restrictions") if isinstance(data, dict) else None,
-            "country_restrictions": (data or {}).get("country_restrictions") if isinstance(data, dict) else None,
+            "age_restrictions": age_rest,
+            "country_restrictions": country_rest,
             "checked_at": now_iso(),
             "feed_hint": feed_hint,
             "fb_error_code": (data or {}).get("error", {}).get("code") if isinstance(data, dict) else None,
@@ -256,6 +318,7 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str, acce
             "name": None, "link": None, "checked_at": now_iso(),
             "fb_error_code": None, "fb_error_message": str(e), "feed_hint": None,
         }
+
 
 def is_abnormal(row: Dict[str, Any]) -> bool:
     # 只把“确定异常”入清单
