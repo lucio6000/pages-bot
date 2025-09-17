@@ -594,12 +594,6 @@ def monitor_loop():
         if RUN_FLAG.is_set() and MANUAL_PENDING.is_set():
             _drain_manual()
 
-# ==== 开机自启内部轮询（可选）====
-if os.getenv("BOT_AUTOSTART", "false").lower() == "true":
-    if not RUN_FLAG.is_set():
-        RUN_FLAG.set()
-        threading.Thread(target=monitor_loop, daemon=True).start()
-        print(f"[BOOT] 自动轮询已启动（间隔 {CONFIG['SCHEDULE']['interval_seconds']}s）")
 
 def clean_text(s: str) -> str:
     if not s: return ""
@@ -682,6 +676,24 @@ def run_once_with_lock(source, chat_id, notify_start=False):
         globals()["RUN_SOURCE"] = ""
         globals()["RUN_HOLDER"] = ""
         RUN_MUTEX.release()
+
+def _start_monitor_if_needed():
+    try:
+        if os.getenv("BOT_AUTOSTART", "false").lower() == "true" and not RUN_FLAG.is_set():
+            RUN_FLAG.set()
+            threading.Thread(target=monitor_loop, daemon=True, name="monitor-loop").start()
+            print(f"[BOOT] 自动轮询已启动（间隔 {CONFIG['SCHEDULE']['interval_seconds']}s）")
+    except Exception as e:
+        print("[BOOT] failed to start monitor:", e)
+
+# 1) 模块导入完、所有函数都已定义之后再尝试自启
+_start_monitor_if_needed()
+
+# 2) 保险：首个请求到来时再确保一次（防 “预加载”等特殊启动顺序）
+@app.before_first_request
+def _ensure_boot():
+    _start_monitor_if_needed()
+
 
 @app.route("/feishu/events", methods=["POST"])
 def feishu_events():
