@@ -4,7 +4,7 @@ Feishu 群机器人 + Facebook Page(粉丝页/主页) 监控（Render 版）
 - 群里 @机器人：执行/开始/暂停/中止/抢占执行/间隔=3600/状态/chatid/帮助
 - 支持：自动轮询 + 手动触发并存；去重；超时；可中止；本轮结束补跑手动
 - 仅把三态写入 result_pages.txt：OK / UNPUBLISHED / NOT_FOUND
-- 年龄墙/国家墙：按 OK 统计与写入，不计为异常
+- 年龄墙/国家墙：仅日志提示，不计入异常
 - “运行异常/权限类”：NEED_TOKEN/AUTH_ERROR/RATE_LIMIT/UNKNOWN/NETWORK_ERROR/TIMEOUT/CANCELLED/WORKER_ERROR
   在飞书推送中单独分区展示（按你指定的样式）
 """
@@ -37,7 +37,7 @@ CONFIG = {
         "BACKOFF_FACTOR": float(os.getenv("FB_BACKOFF_FACTOR", "0.5")),
         "ROUND_TIMEOUT": int(os.getenv("FB_ROUND_TIMEOUT", "180")),   # 整轮最多等待秒数
         "FUTURE_EXTRA_GRACE": int(os.getenv("FB_FUTURE_EXTRA_GRACE", "2")),
-        # 是否额外探针访问 feed（用来侧写权限/墙）
+        # 是否额外探针访问 feed（用来侧写权限/墙）；没 token 时建议打开；有 token 也可保守关闭
         "PROBE_FEED": os.getenv("FB_PROBE_FEED", "true").lower() == "true",
     },
     "FEISHU": {
@@ -65,8 +65,8 @@ CONFIG = {
 CERTAIN_ABNORMAL = {"UNPUBLISHED", "NOT_FOUND"}    # 确定异常（会计入“确定异常 清单”）
 TECH_EXCEPTIONS  = {"NEED_TOKEN", "AUTH_ERROR", "RATE_LIMIT", "UNKNOWN",
                     "NETWORK_ERROR", "TIMEOUT", "CANCELLED", "WORKER_ERROR"}  # 运行/权限/网络类（单独分区）
-IGNORED_STATUSES = {"RESTRICTED_AGE", "RESTRICTED_COUNTRY"}  # 年龄墙/国家墙（按 OK 统计/写入）
-RESULT_KEEP_STATUSES = {"OK", "UNPUBLISHED", "NOT_FOUND"}    # 三态写入结果文件
+IGNORED_STATUSES = {"RESTRICTED_AGE", "RESTRICTED_COUNTRY"}  # 年龄墙/国家墙：仅日志提示
+RESULT_KEEP_STATUSES = {"OK", "UNPUBLISHED", "NOT_FOUND"}    # 仅这三态写入结果文件
 
 def _bucket(status: str) -> str:
     s = (status or "").upper()
@@ -163,18 +163,21 @@ def load_label_id_pairs(path: str) -> List[Tuple[str, str]]:
     if not os.path.exists(path):
         return []
     pairs, seen = [], set()
-    # 允许 label 中包含空格/连字符/中英文符号；匹配“...-<纯数字ID>”且 ID 在行尾（允许末尾有分隔符）
+    # 支持标签中包含空格/连字符/中英文符号；匹配“...-<纯数字ID>”且 ID 在行尾（允许末尾有分隔符）
     pat = re.compile(r"(.+?)-(\d{5,})\s*[,\s;，、]*$", re.UNICODE)
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
-            if not s or s.startswith("#"): continue
+            if not s or s.startswith("#"):
+                continue
             m = pat.search(s)
-            if not m: continue
+            if not m:
+                continue
             label = m.group(1).strip().rstrip(",;，、")
             pid = m.group(2).strip()
             if pid not in seen:
-                seen.add(pid); pairs.append((label, pid))
+                seen.add(pid)
+                pairs.append((label, pid))
     return pairs
 
 def build_session() -> requests.Session:
@@ -362,7 +365,7 @@ def check_pages_one_round():
     id_to_label = {pid: label for (label, pid) in pairs}
     results = []
 
-    ex = ThreadPoolExecutor(max_workers=max(1, fb["CONCURRENCY"])))
+    ex = ThreadPoolExecutor(max_workers=max(1, fb["CONCURRENCY"]))
     futs = {
         ex.submit(
             probe_page, session, page_id, fb["GRAPH_VERSION"],
@@ -402,7 +405,7 @@ def check_pages_one_round():
                     r = {"page_id": pid, "status": "WORKER_ERROR", "normal": -1, "checked_at": now_iso(), "name": None, "fb_error_message": str(e)}
                 r["label"] = label; results.append(r)
                 done_idx += 1
-                tag = "✅" if (r.get("status") or "").upper() == "OK" or _bucket(r.get("status")) == "ignored" else ("❌" if _bucket(r.get("status")) == "certain_abnormal" else "⚠️")
+                tag = "✅" if (r.get("status") or "").upper() == "OK" else ("❌" if _bucket(r.get("status")) == "certain_abnormal" else "⚠️")
                 nm = f" | {r.get('name')}" if r.get("name") else ""
                 extra = []
                 if r.get("age_restrictions"): extra.append(f"age={r['age_restrictions']}")
@@ -416,7 +419,7 @@ def check_pages_one_round():
         except: pass
 
     # 三态写入文件：OK / UNPUBLISHED / NOT_FOUND
-    # 另外：忽略类（年龄/国家墙）也按 OK 写入
+    # 另外：忽略类（年龄/国家墙）也按 OK 写入与计数
     tri_lines = []
     for r in results:
         st = (r.get("status") or "").upper()
@@ -426,7 +429,9 @@ def check_pages_one_round():
         if bucket == "tri_state":
             tri_lines.append(f"{_fmt_label_id(r)} | {st}")
         elif bucket == "ignored":
+            # 忽略类视为 OK
             tri_lines.append(f"{_fmt_label_id(r)} | OK")
+
     append_unique_lines(fb["OUT_TXT"], tri_lines)
 
     # OK 计数 = 真实 OK + 忽略类
@@ -434,6 +439,7 @@ def check_pages_one_round():
         1 for r in results
         if ((r.get("status") or "").upper() == "OK") or (_bucket(r.get("status")) == "ignored")
     )
+
 
     # 确定异常（无 “- ” 前缀）
     certain_ab_list = [
@@ -521,8 +527,7 @@ def push_summary(round_name, ok, ab_labels, chat_id=None,
                  started_at: datetime | None = None,
                  ended_at:   datetime | None = None,
                  duration_sec: int | None = None,
-                 tech_issues: list[str] | None = None,
-                 total: int | None = None):
+                 tech_issues: list[str] | None = None):
     tech_issues = tech_issues or []
     targets = _target_chat_ids(chat_id)
     title = f"【FB Page 监控】{round_name}"
@@ -538,9 +543,7 @@ def push_summary(round_name, ok, ab_labels, chat_id=None,
         shown_time = now_local_str()
         lines.append(f"时间：{shown_time}")
 
-    # 统计行（含总数）
-    if total is not None:
-        lines.append(f"总数：{total}")
+    # 统计行
     lines.append(f"正常(OK)：{ok}")
 
     # 确定异常（无 “- ” 前缀）
@@ -666,7 +669,7 @@ def run_once_with_lock(source, chat_id, notify_start=False):
         end_wall = datetime.now(tz)
         duration = max(0, int(time.monotonic() - start_mono))
         print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_labels)} tech={len(tech_issues)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
-        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_issues, total=total)
+        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_issues)
         return True
 
     except Exception as e:
