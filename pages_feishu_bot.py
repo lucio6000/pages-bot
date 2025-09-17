@@ -3,7 +3,10 @@
 Feishu 群机器人 + Facebook Page(粉丝页/主页) 监控（Render 版）
 - 群里 @机器人：执行/开始/暂停/中止/抢占执行/间隔=3600/状态/chatid/帮助
 - 支持：自动轮询 + 手动触发并存；去重；超时；可中止；本轮结束补跑手动
-- 仅把“确定异常”的别名写入 result_pages.txt（追加去重）
+- 仅把三态写入 result_pages.txt：OK / UNPUBLISHED / NOT_FOUND
+- 年龄墙/国家墙：仅日志提示，不计入异常
+- “运行异常/权限类”：NEED_TOKEN/AUTH_ERROR/RATE_LIMIT/UNKNOWN/NETWORK_ERROR/TIMEOUT/CANCELLED/WORKER_ERROR
+  在飞书推送中单独分区展示（按你指定的样式）
 """
 
 import os, re, json, time, threading, traceback
@@ -25,7 +28,7 @@ CONFIG = {
         "MAPPING_FILE": os.getenv("FB_PAGE_MAPPING_FILE", "pages.txt"),
         "CONCURRENCY": int(os.getenv("FB_CONCURRENCY", "6")),
         "GRAPH_VERSION": os.getenv("FB_GRAPH_VERSION", "v21.0"),
-        # 建议：System User 拿到的 Page 长效访问令牌。如果没有，也能做“存在/不存在”等有限检测
+        # 建议：System User 或 Page 的访问令牌；client_pages 场景会自动换 Page Token 读 /settings
         "ACCESS_TOKEN": os.getenv("FB_ACCESS_TOKEN"),
         "NEED_TOKEN_AS_NORMAL": os.getenv("FB_NEED_TOKEN_AS_NORMAL", "false").lower() == "true",
         "OUT_TXT": os.getenv("FB_OUT_TXT", "result_pages.txt"),
@@ -34,7 +37,7 @@ CONFIG = {
         "BACKOFF_FACTOR": float(os.getenv("FB_BACKOFF_FACTOR", "0.5")),
         "ROUND_TIMEOUT": int(os.getenv("FB_ROUND_TIMEOUT", "180")),   # 整轮最多等待秒数
         "FUTURE_EXTRA_GRACE": int(os.getenv("FB_FUTURE_EXTRA_GRACE", "2")),
-        # 是否额外探针访问 feed（用来侧写年龄/国家墙），没 token 时建议打开；有 token 也可保守关闭
+        # 是否额外探针访问 feed（用来侧写权限/墙）；没 token 时建议打开；有 token 也可保守关闭
         "PROBE_FEED": os.getenv("FB_PROBE_FEED", "true").lower() == "true",
     },
     "FEISHU": {
@@ -56,6 +59,32 @@ CONFIG = {
         "interval_seconds": int(os.getenv("BOT_INTERVAL_SECONDS", "3600")),
     }
 }
+# ======================================================
+
+# =============== 状态分组常量 & 工具 ===============
+CERTAIN_ABNORMAL = {"UNPUBLISHED", "NOT_FOUND"}    # 确定异常（会计入“确定异常 清单”）
+TECH_EXCEPTIONS  = {"NEED_TOKEN", "AUTH_ERROR", "RATE_LIMIT", "UNKNOWN",
+                    "NETWORK_ERROR", "TIMEOUT", "CANCELLED", "WORKER_ERROR"}  # 运行/权限/网络类（单独分区）
+IGNORED_STATUSES = {"RESTRICTED_AGE", "RESTRICTED_COUNTRY"}  # 年龄墙/国家墙：仅日志提示
+RESULT_KEEP_STATUSES = {"OK", "UNPUBLISHED", "NOT_FOUND"}    # 仅这三态写入结果文件
+
+def _bucket(status: str) -> str:
+    s = (status or "").upper()
+    if s in CERTAIN_ABNORMAL:      return "certain_abnormal"
+    if s in TECH_EXCEPTIONS:       return "tech_exception"
+    if s in IGNORED_STATUSES:      return "ignored"
+    if s in RESULT_KEEP_STATUSES:  return "tri_state"
+    return "other"
+
+def _fmt_label_id(r: Dict[str, Any]) -> str:
+    """输出 Label-1234567890；兼容 page_id/app_id 字段"""
+    label = (r.get("label") or "").strip()
+    rid = r.get("page_id") or r.get("app_id") or ""
+    return f"{label}-{rid}".strip("-")
+
+def is_abnormal(row: Dict[str, Any]) -> bool:
+    s = (row.get("status") or "").upper()
+    return s in CERTAIN_ABNORMAL or s in TECH_EXCEPTIONS
 # ======================================================
 
 # 线程安全
@@ -99,8 +128,8 @@ def _try_unstick_mutex(force: bool = False) -> bool:
         print(f"[WATCHDOG] force reset RUN_MUTEX (holder={_holder()})")
         RUN_MUTEX = threading.Lock()
         RUN_ACTIVE.clear()
-        _set_src("")
-        _set_holder("")
+        globals()["RUN_SOURCE"] = ""
+        globals()["RUN_HOLDER"] = ""
         CANCEL_EVENT.clear()
         LOCK_STUCK_SINCE = 0.0
         return True
@@ -113,19 +142,14 @@ def _try_unstick_mutex(force: bool = False) -> bool:
         if now - LOCK_STUCK_SINCE > limit:
             print(f"[WATCHDOG] reset RUN_MUTEX due to stale lock (stuck_for={now-LOCK_STUCK_SINCE:.1f}s, holder={_holder()})")
             RUN_MUTEX = threading.Lock()
-            _set_src(""); _set_holder("")
+            globals()["RUN_SOURCE"] = ""
+            globals()["RUN_HOLDER"] = ""
             LOCK_STUCK_SINCE = 0.0
             CANCEL_EVENT.clear()
             return True
     else:
         LOCK_STUCK_SINCE = 0.0
     return False
-
-def _set_holder(v: str):
-    globals()["RUN_HOLDER"] = v
-
-def _set_src(v: str):
-    globals()["RUN_SOURCE"] = v
 
 # ---------------- Facebook Page 检测逻辑 ----------------
 def now_iso() -> str:
@@ -163,38 +187,29 @@ def build_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retries, pool_connections=200, pool_maxsize=200)
     sess.mount("https://", adapter)
-    sess.headers.update({"User-Agent": "fb-page-feishu-bot/1.0"})
+    sess.headers.update({"User-Agent": "fb-page-feishu-bot/1.1"})
     return sess
 
 def classify_page_status(http_status: int, payload: Optional[Dict[str, Any]], had_token: bool, need_token_as_normal: bool) -> Tuple[str, int]:
     """返回 (status, normal_flag)；normal_flag: 1正常/0确定异常/-1未知/临时失败"""
     if http_status == 200 and isinstance(payload, dict) and payload.get("id"):
-        # 拿到基础信息，先判断字段
-        is_published = payload.get("is_published")
-        age_rest = payload.get("age_restrictions")
-        country_rest = payload.get("country_restrictions")
-        if is_published is False:
-            return "UNPUBLISHED", 0
-        if age_rest and str(age_rest).strip().lower() not in ("", "13+"):
-            return "RESTRICTED_AGE", 0
-        if country_rest and str(country_rest).strip() not in ("", "None"):
-            return "RESTRICTED_COUNTRY", 0
         return "OK", 1
 
     err = (payload or {}).get("error") if isinstance(payload, dict) else None
     code = (err or {}).get("code")
-    msg = ((err or {}).get("message") or "").lower()
+    msg = ((err or {}).get("message") or "").lower() if isinstance(err, dict) else ""
 
     if code == 803 or "unknown path components" in msg or "do not exist" in msg:
         return "NOT_FOUND", 0
     if code in (4, 17) or "limit" in msg:
         return "RATE_LIMIT", -1
     if code == 190 or "#10" in msg or "#200" in msg or "permission" in msg or "access token" in msg:
-        # 没 token 或权限不足 → “未知/无法确认”，不计入确定异常
         if not had_token:
-            # 可根据 need_token_as_normal 决定是否把 NEED_TOKEN 视为正常
             return "NEED_TOKEN", (1 if need_token_as_normal else -1)
         return "AUTH_ERROR", -1
+
+    if http_status is None:
+        return "NETWORK_ERROR", -1
 
     return "UNKNOWN", -1
 
@@ -261,21 +276,22 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
                 else:
                     settings_perm_err = True
 
-        # 3) 判定（尽量只对“确定异常”给 ❌）
+        # 3) 判定：未发布 / 国家墙 / 年龄墙 / OK
         status, normal_flag = classify_page_status(resp.status_code, data, had_token, CONFIG["FB"]["NEED_TOKEN_AS_NORMAL"])
         if resp.status_code == 200 and isinstance(data, dict) and data.get("id"):
             is_published = data.get("is_published")
             if is_published is False:
                 status, normal_flag = "UNPUBLISHED", 0
-            elif age_rest and str(age_rest).strip().lower() not in ("", "13+"):
-                status, normal_flag = "RESTRICTED_AGE", 0
             elif country_rest and str(country_rest).strip() not in ("", "None"):
                 status, normal_flag = "RESTRICTED_COUNTRY", 0
+            elif age_rest and str(age_rest).strip().lower() not in ("", "13+"):
+                status, normal_flag = "RESTRICTED_AGE", 0
             else:
-                # 若 /settings 权限被挡，给出提示但不当作“确定异常”
-                status = "OK" if normal_flag == 1 else status
+                status, normal_flag = "OK", 1
+        else:
+            is_published = None
 
-        # 4) 可选：feed 探针侧写（保留你原来的行为）
+        # 4) 可选：feed 探针侧写
         feed_hint = None
         if probe_feed and status in ("OK", "NEED_TOKEN", "AUTH_ERROR", "UNKNOWN", "RATE_LIMIT"):
             try:
@@ -286,10 +302,10 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
                 dfeed = rfeed.json() if "application/json" in (rfeed.headers.get("content-type") or "") else None
                 if rfeed.status_code != 200:
                     er = (dfeed or {}).get("error") or {}
-                    emsg = (er.get("message") or "").lower()
-                    if any(k in emsg for k in ["permissions", "requires", "not authorized", "#10", "#200"]):
+                    emsg2 = (er.get("message") or "").lower()
+                    if any(k in emsg2 for k in ["permissions", "requires", "not authorized", "#10", "#200"]):
                         feed_hint = "FEED_PERMISSION_BLOCKED"
-                    elif any(k in emsg for k in ["country", "age", "restricted"]):
+                    elif any(k in emsg2 for k in ["country", "age", "restricted"]):
                         feed_hint = "FEED_GEO_AGE_RESTRICTED"
             except Exception:
                 pass
@@ -303,7 +319,7 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
             "normal": normal_flag,
             "name": (data or {}).get("name") if isinstance(data, dict) else None,
             "link": (data or {}).get("link") if isinstance(data, dict) else None,
-            "is_published": (data or {}).get("is_published") if isinstance(data, dict) else None,
+            "is_published": is_published,
             "age_restrictions": age_rest,
             "country_restrictions": country_rest,
             "checked_at": now_iso(),
@@ -318,11 +334,6 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
             "name": None, "link": None, "checked_at": now_iso(),
             "fb_error_code": None, "fb_error_message": str(e), "feed_hint": None,
         }
-
-
-def is_abnormal(row: Dict[str, Any]) -> bool:
-    # 只把“确定异常”入清单
-    return row.get("status") in {"UNPUBLISHED", "RESTRICTED_AGE", "RESTRICTED_COUNTRY", "NOT_FOUND"}
 
 def append_unique_lines(path: str, lines: List[str]):
     if not lines: return
@@ -343,7 +354,7 @@ def check_pages_one_round():
     pairs = load_label_id_pairs(fb["MAPPING_FILE"])
     total = len(pairs)
     if total == 0:
-        return 0, [], 0
+        return 0, [], 0, []  # 无数据时四元组返回
 
     session = build_session()
     id_to_label = {pid: label for (label, pid) in pairs}
@@ -386,22 +397,48 @@ def check_pages_one_round():
                 try:
                     r = fut.result()
                 except Exception as e:
-                    r = {"page_id": pid, "status": "WORKER_ERROR", "normal": -1, "checked_at": now_iso(), "name": None}
+                    r = {"page_id": pid, "status": "WORKER_ERROR", "normal": -1, "checked_at": now_iso(), "name": None, "fb_error_message": str(e)}
                 r["label"] = label; results.append(r)
                 done_idx += 1
-                tag = "✅" if r.get("normal") == 1 else ("❌" if r.get("normal") == 0 else "⚠️")
+                tag = "✅" if (r.get("status") or "").upper() == "OK" else ("❌" if _bucket(r.get("status")) == "certain_abnormal" else "⚠️")
                 nm = f" | {r.get('name')}" if r.get("name") else ""
-                print(f"[{now_local_str()}] {tag} ({done_idx}/{total}) {label}-{r['page_id']}{nm} -> {r.get('status')}")
+                extra = []
+                if r.get("age_restrictions"): extra.append(f"age={r['age_restrictions']}")
+                if r.get("country_restrictions"): extra.append(f"country={r['country_restrictions']}")
+                suffix = f" [{', '.join(extra)}]" if extra else ""
+                print(f"[{now_local_str()}] {tag} ({done_idx}/{total}) {label}-{r['page_id']}{nm} -> {r.get('status')}{suffix}")
 
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
         try: session.close()
         except: pass
 
-    abnormal_labels = [f"{r['label']}异常" for r in results if is_abnormal(r) and r.get("label")]
-    append_unique_lines(fb["OUT_TXT"], abnormal_labels)
-    ok_count = sum(1 for r in results if r.get("normal") == 1)
-    return ok_count, abnormal_labels, total
+    # 三态写入文件：OK / UNPUBLISHED / NOT_FOUND
+    tri_lines = []
+    for r in results:
+        st = (r.get("status") or "").upper()
+        if _bucket(st) == "tri_state" and r.get("label"):
+            tri_lines.append(f"{_fmt_label_id(r)} | {st}")
+    append_unique_lines(fb["OUT_TXT"], tri_lines)
+
+    # 统计 OK
+    ok_count = sum(1 for r in results if (r.get("status") or "").upper() == "OK")
+
+    # 确定异常（无 “- ” 前缀）
+    certain_ab_list = [
+        f"{_fmt_label_id(r)} | {(r.get('status') or '').upper()}"
+        for r in results
+        if r.get("label") and _bucket(r.get("status")) == "certain_abnormal"
+    ]
+
+    # 运行异常/权限类（有 “- ” 前缀由 push_summary 统一加，这里只给主体）
+    tech_issues_list = [
+        f"{_fmt_label_id(r)} | {(r.get('status') or '').upper()}"
+        for r in results
+        if r.get("label") and _bucket(r.get("status")) == "tech_exception"
+    ]
+
+    return ok_count, certain_ab_list, total, tech_issues_list
 
 # ---------------- 飞书机器人（事件 + 发送） ----------------
 app = Flask(__name__)
@@ -472,9 +509,12 @@ def _target_chat_ids(preferred: Optional[str] = None):
 def push_summary(round_name, ok, ab_labels, chat_id=None,
                  started_at: datetime | None = None,
                  ended_at:   datetime | None = None,
-                 duration_sec: int | None = None):
+                 duration_sec: int | None = None,
+                 tech_issues: list[str] | None = None):
+    tech_issues = tech_issues or []
     targets = _target_chat_ids(chat_id)
     title = f"【FB Page 监控】{round_name}"
+
     lines = [title]
     if started_at and ended_at:
         lines += [
@@ -485,21 +525,33 @@ def push_summary(round_name, ok, ab_labels, chat_id=None,
     else:
         shown_time = now_local_str()
         lines.append(f"时间：{shown_time}")
-    lines.append(f"正常：{ok}")
+
+    # 统计行
+    lines.append(f"正常(OK)：{ok}")
+
+    # 确定异常（无 “- ” 前缀）
     if ab_labels:
-        lines.append(f"异常：{len(ab_labels)}")
-        lines.append("异常清单（最多50条）：\n" + "\n".join(f"- {x}" for x in ab_labels[:50]))
+        lines.append(f"\n确定异常：{len(ab_labels)}")
+        lines += [x for x in ab_labels[:50]]
         if len(ab_labels) > 50:
             lines.append(f"... 还有 {len(ab_labels)-50} 条")
-    else:
-        if not CONFIG["FEISHU"]["push_on_no_abnormal"]:
-            return
-        lines.append("本轮无确定异常 ✅")
+
+    # 运行异常/权限类（有 “- ” 前缀）
+    if tech_issues:
+        lines.append(f"\n运行异常/权限类：{len(tech_issues)}")
+        lines += [f"- {x}" for x in tech_issues[:50]]
+        if len(tech_issues) > 50:
+            lines.append(f"... 还有 {len(tech_issues)-50} 条")
+
+    # 若两类都没有，按配置决定是否推送
+    if not ab_labels and not tech_issues and not CONFIG["FEISHU"]["push_on_no_abnormal"]:
+        return
+
     msg = "\n".join(lines)
     for tgt in targets:
         _send_text(tgt, msg)
     LAST_SUMMARY.update({"time": shown_time, "ok": ok, "ab": len(ab_labels), "source": round_name})
-    print(f"[PUSH] {round_name}: ok={ok} ab={len(ab_labels)} to={targets}")
+    print(f"[PUSH] {round_name}: ok={ok} ab={len(ab_labels)} tech={len(tech_issues)} to={targets}")
 
 def _drain_manual():
     while MANUAL_PENDING.is_set():
@@ -516,7 +568,6 @@ def monitor_loop():
 
         interval = int(CONFIG["SCHEDULE"]["interval_seconds"])
         for _ in range(interval):
-            # 等待期顺便跑一次非强制自愈（卡锁但非执行态 & 超时）
             _try_unstick_mutex(force=False)
             if not RUN_FLAG.is_set() or MANUAL_PENDING.is_set() or CANCEL_EVENT.is_set():
                 print(f"[MON] break wait: pause={not RUN_FLAG.is_set()} manual={MANUAL_PENDING.is_set()} cancel={CANCEL_EVENT.is_set()}")
@@ -578,7 +629,7 @@ def run_once_with_lock(source, chat_id, notify_start=False):
             print(f"[RUN] skip overlapped: {source} | active={RUN_ACTIVE.is_set()} locked={RUN_MUTEX.locked()} holder={_holder()} stuck_for={_lock_stuck_for():.1f}s")
             return False
 
-    _set_holder(f"{source}::{threading.current_thread().name}")
+    globals()["RUN_HOLDER"] = f"{source}::{threading.current_thread().name}"
 
     try:
         # 2) 设置执行态 + 可选“已开始执行”
@@ -587,7 +638,7 @@ def run_once_with_lock(source, chat_id, notify_start=False):
         start_wall = datetime.now(tz)
         start_mono = time.monotonic()
         globals()["RUN_START_AT"] = start_mono
-        _set_src(source)
+        globals()["RUN_SOURCE"] = source
         CANCEL_EVENT.clear()
 
         print(f"[RUN] start {source}: at {start_wall.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -595,13 +646,13 @@ def run_once_with_lock(source, chat_id, notify_start=False):
             _send_text(chat_id, "已开始执行，稍后回报结果")
 
         # 3) 一轮检测
-        ok, ab_labels, total = check_pages_one_round()
+        ok, ab_labels, total, tech_issues = check_pages_one_round()
 
         # 4) 结束并推送
         end_wall = datetime.now(tz)
         duration = max(0, int(time.monotonic() - start_mono))
-        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_labels)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
-        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration)
+        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_labels)} tech={len(tech_issues)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
+        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_issues)
         return True
 
     except Exception as e:
@@ -611,7 +662,8 @@ def run_once_with_lock(source, chat_id, notify_start=False):
 
     finally:
         RUN_ACTIVE.clear()
-        _set_src(""); _set_holder("")
+        globals()["RUN_SOURCE"] = ""
+        globals()["RUN_HOLDER"] = ""
         RUN_MUTEX.release()
 
 @app.route("/feishu/events", methods=["POST"])
