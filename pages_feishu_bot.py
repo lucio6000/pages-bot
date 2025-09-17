@@ -116,14 +116,21 @@ def _holder() -> str:
     return RUN_HOLDER or "<none>"
 
 def _run_elapsed_sec() -> int:
-    return int(time.monotonic() - RUN_START_AT) if RUN_ACTIVE.is_set() else 0
+    if not RUN_ACTIVE.is_set():
+        return 0
+    if RUN_START_AT <= 0:
+        return 0  # 或者返回 -1 表示未知
+    return int(time.monotonic() - RUN_START_AT)
 
 def _lock_stuck_for() -> float:
     return 0.0 if LOCK_STUCK_SINCE == 0.0 else (time.monotonic() - LOCK_STUCK_SINCE)
 
 def _try_unstick_mutex(force: bool = False) -> bool:
-    """卡锁/脏锁自愈：在锁被占但非执行态且超时后重建锁；force=True时无条件重置"""
+    """卡锁/脏锁自愈：支持非执行态和执行态两种场景；force=True 时无条件重置"""
     global RUN_MUTEX, LOCK_STUCK_SINCE
+    now = time.monotonic()
+    limit = CONFIG["FB"]["ROUND_TIMEOUT"] + CONFIG["FB"]["FUTURE_EXTRA_GRACE"]
+
     if force:
         print(f"[WATCHDOG] force reset RUN_MUTEX (holder={_holder()})")
         RUN_MUTEX = threading.Lock()
@@ -134,21 +141,37 @@ def _try_unstick_mutex(force: bool = False) -> bool:
         LOCK_STUCK_SINCE = 0.0
         return True
 
+    # 情况 A：锁被占用但不在执行态（原逻辑）
     if RUN_MUTEX.locked() and not RUN_ACTIVE.is_set():
-        now = time.monotonic()
         if LOCK_STUCK_SINCE == 0.0:
             LOCK_STUCK_SINCE = now
-        limit = CONFIG["FB"]["ROUND_TIMEOUT"] + CONFIG["FB"]["FUTURE_EXTRA_GRACE"]
         if now - LOCK_STUCK_SINCE > limit:
-            print(f"[WATCHDOG] reset RUN_MUTEX due to stale lock (stuck_for={now-LOCK_STUCK_SINCE:.1f}s, holder={_holder()})")
+            print(f"[WATCHDOG] reset RUN_MUTEX due to stale NON-ACTIVE lock "
+                  f"(stuck_for={now-LOCK_STUCK_SINCE:.1f}s, holder={_holder()})")
             RUN_MUTEX = threading.Lock()
             globals()["RUN_SOURCE"] = ""
             globals()["RUN_HOLDER"] = ""
             LOCK_STUCK_SINCE = 0.0
             CANCEL_EVENT.clear()
             return True
+        return False
     else:
         LOCK_STUCK_SINCE = 0.0
+
+    # 情况 B：锁被占用且在执行态，但执行时长明显超时 → 直接强制复位
+    if RUN_MUTEX.locked() and RUN_ACTIVE.is_set():
+        start_at = RUN_START_AT or 0.0
+        elapsed = now - start_at if start_at > 0 else now
+        if elapsed > limit:
+            print(f"[WATCHDOG] force reset RUN_MUTEX due to ACTIVE lock timeout "
+                  f"(elapsed={elapsed:.1f}s > {limit}s, holder={_holder()})")
+            RUN_MUTEX = threading.Lock()
+            RUN_ACTIVE.clear()
+            globals()["RUN_SOURCE"] = ""
+            globals()["RUN_HOLDER"] = ""
+            CANCEL_EVENT.clear()
+            return True
+
     return False
 
 # ---------------- Facebook Page 检测逻辑 ----------------
@@ -645,14 +668,15 @@ def run_once_with_lock(source, chat_id, notify_start=False):
     try:
         # 2) 设置执行态 + 可选“已开始执行”
         RUN_ACTIVE.set()
-        tz = ZoneInfo(CONFIG["FEISHU"]["tz"])
-        start_wall = datetime.now(tz)
         start_mono = time.monotonic()
-        globals()["RUN_START_AT"] = start_mono
+        globals()["RUN_START_AT"] = start_mono  # ← 提前写
         globals()["RUN_SOURCE"] = source
         CANCEL_EVENT.clear()
 
+        tz = ZoneInfo(CONFIG["FEISHU"]["tz"])
+        start_wall = datetime.now(tz)
         print(f"[RUN] start {source}: at {start_wall.strftime('%Y-%m-%d %H:%M:%S')}")
+
         if notify_start and chat_id:
             _send_text(chat_id, "已开始执行，稍后回报结果")
 
@@ -802,12 +826,20 @@ def feishu_events():
     elif cmd in ("中止", "取消本轮", "abort", "cancel"):
         if RUN_ACTIVE.is_set():
             CANCEL_EVENT.set()
-            _send_text(chat_id, "已请求中止当前轮，1-2 秒内释放执行状态")
-            print("[REPLY] abort current round")
+            _send_text(chat_id, "已请求中止当前轮，等待释放…")
+            # 最多等 3 秒
+            for _ in range(3):
+                if not RUN_MUTEX.locked():
+                    break
+                time.sleep(1)
+            if RUN_MUTEX.locked():
+                _try_unstick_mutex(force=True)
+                _send_text(chat_id, "未及时释放，已强制解锁")
+            print("[REPLY] abort current round (with watchdog)")
         else:
             if RUN_MUTEX.locked():
                 _try_unstick_mutex(force=True)
-                _send_text(chat_id, "检测到锁异常，已强制解锁")
+                _send_text(chat_id, "当前未在执行，但检测到锁异常，已强制解锁")
             else:
                 _send_text(chat_id, "当前未在执行中，无需中止")
 
@@ -825,6 +857,10 @@ def feishu_events():
                 MANUAL_PENDING.set()
                 _send_text(chat_id, "当前仍在释放中，已加入队列，稍后自动补跑")
         threading.Thread(target=_force, daemon=True).start()
+
+    elif cmd in ("重置锁", "reset-lock", "unlock"):
+        _try_unstick_mutex(force=True)
+        _send_text(chat_id, f"已强制重置互斥锁（holder={_holder()}）")
 
     elif cmd in ("状态", "status"):
         try:
