@@ -677,6 +677,10 @@ def run_once_with_lock(source, chat_id, notify_start=False):
         globals()["RUN_HOLDER"] = ""
         RUN_MUTEX.release()
 
+# ==== 安全自启：支持模块导入后立即尝试一次 + 首个请求再确保一次 ====
+
+_BOOT_ONCE = threading.Event()
+
 def _start_monitor_if_needed():
     try:
         if os.getenv("BOT_AUTOSTART", "false").lower() == "true" and not RUN_FLAG.is_set():
@@ -686,13 +690,15 @@ def _start_monitor_if_needed():
     except Exception as e:
         print("[BOOT] failed to start monitor:", e)
 
-# 1) 模块导入完、所有函数都已定义之后再尝试自启
+# 模块加载完成后，尝试自启一次（此时所有函数已定义，避免 NameError）
 _start_monitor_if_needed()
 
-# 2) 保险：首个请求到来时再确保一次（防 “预加载”等特殊启动顺序）
-@app.before_first_request
-def _ensure_boot():
-    _start_monitor_if_needed()
+# 保险：首个请求到来时再确保一次（Flask 3.x 用 before_request）
+@app.before_request
+def _ensure_boot_on_request():
+    if not _BOOT_ONCE.is_set():
+        _start_monitor_if_needed()
+        _BOOT_ONCE.set()
 
 
 @app.route("/feishu/events", methods=["POST"])
