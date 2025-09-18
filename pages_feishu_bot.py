@@ -369,6 +369,61 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
             "name": None, "owner_name": None, "link": None, "checked_at": now_iso(),
             "fb_error_code": None, "fb_error_message": str(e), "feed_hint": None,
         }
+    
+
+# ---- Owner 查询（仅对异常页调用）----
+_owner_cache: dict[str, str] = {}
+
+def fetch_owner_name(session: requests.Session, page_id: str, graph_version: str,
+                     access_token: Optional[str], timeout: int) -> str:
+    """
+    只尝试轻量方式拿 Owner 名称；失败就返回 '未知'
+    1) /{page-id}?fields=owner_business{name}
+       - 若 BM 真正拥有该 Page，会返回 owner_business.name
+    2) 兜底再试 /{page-id}?fields=owner_business （拿 id 再去 /{bm-id}?fields=name）
+    3) 全部拿不到则 '未知'
+    """
+    if not access_token:
+        return "未知"
+
+    # 缓存命中
+    if page_id in _owner_cache:
+        return _owner_cache[page_id]
+
+    base = f"https://graph.facebook.com/{graph_version}/{page_id}"
+    try:
+        # 方式 A：嵌套拿 name
+        params = {"fields": "owner_business{name}", "access_token": access_token}
+        r = session.get(base, params=params, timeout=timeout)
+        j = r.json() if "application/json" in (r.headers.get("content-type") or "") else {}
+        ob = (j or {}).get("owner_business") or {}
+        name = (ob.get("name") or "").strip()
+        if name:
+            _owner_cache[page_id] = name
+            return name
+
+        # 方式 B：先拿 owner_business id 再查 BM 名
+        params = {"fields": "owner_business", "access_token": access_token}
+        r2 = session.get(base, params=params, timeout=timeout)
+        j2 = r2.json() if "application/json" in (r2.headers.get("content-type") or "") else {}
+        ob2 = (j2 or {}).get("owner_business") or {}
+        bm_id = (ob2.get("id") or "").strip()
+        if bm_id:
+            r3 = session.get(f"https://graph.facebook.com/{graph_version}/{bm_id}",
+                             params={"fields": "name", "access_token": access_token},
+                             timeout=timeout)
+            j3 = r3.json() if "application/json" in (r3.headers.get("content-type") or "") else {}
+            nm = (j3 or {}).get("name")
+            if nm:
+                _owner_cache[page_id] = nm.strip()
+                return _owner_cache[page_id]
+    except Exception:
+        pass
+
+    _owner_cache[page_id] = "未知"
+    return "未知"
+
+
 
 def append_unique_lines(path: str, lines: List[str]):
     if not lines: return
@@ -443,10 +498,40 @@ def check_pages_one_round():
                 suffix = f" [{', '.join(extra)}]" if extra else ""
                 print(f"[{now_local_str()}] {tag} ({done_idx}/{total}) {label}-{r['page_id']}{nm} -> {r.get('status')}{suffix}")
 
+
     finally:
+        # 结束线程池，但不要马上关 session；后面还要用它查 owner
         ex.shutdown(wait=False, cancel_futures=True)
-        try: session.close()
-        except: pass
+
+    # === 仅给“异常页”补齐 owner_name（减少额外 API 调用）===
+    # 异常：确定异常 + 运行异常/权限类；忽略类（年龄/国家墙）不查 Owner
+        abnormal_indexes = []
+        for idx, r in enumerate(results):
+            st = (r.get("status") or "").upper()
+            bucket = _bucket(st)
+            if bucket in ("certain_abnormal", "tech_exception"):
+                abnormal_indexes.append(idx)
+
+        if abnormal_indexes:
+            # 复用同一个 session；逐条给异常页补 owner_name（有缓存，不会重复查）
+            for idx in abnormal_indexes:
+                r = results[idx]
+                if not r.get("owner_name"):  # 只在缺失时查询
+                    owner = fetch_owner_name(
+                        session,
+                        r.get("page_id") or r.get("app_id"),
+                        fb["GRAPH_VERSION"],
+                        fb["ACCESS_TOKEN"],
+                        fb["REQUEST_TIMEOUT"],
+                    )
+                    r["owner_name"] = owner
+
+        # 到这里才关闭 session
+        try:
+            session.close()
+        except:
+            pass
+    
 
     def _pack_item(row: Dict[str, Any]) -> Dict[str, str]:
         page_name = (row.get("name") or "").strip() or (row.get("label") or "").strip() or "(未知名称)"
