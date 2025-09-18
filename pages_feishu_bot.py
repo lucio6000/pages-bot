@@ -716,13 +716,13 @@ def run_once_with_lock(source, chat_id, notify_start=False):
             _send_text(chat_id, "已开始执行，稍后回报结果")
 
         # 3) 一轮检测
-        ok, ab_labels, total, tech_items = check_pages_one_round()
+        ok, ab_items, total, tech_items = check_pages_one_round()
 
         # 4) 结束并推送
         end_wall = datetime.now(tz)
         duration = max(0, int(time.monotonic() - start_mono))
-        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_labels)} tech={len(tech_items)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
-        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_items)
+        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_items)} tech={len(tech_items)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
+        push_summary(source, ok, ab_items, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_items)
         return True
 
     except Exception as e:
