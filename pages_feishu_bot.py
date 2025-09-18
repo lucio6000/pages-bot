@@ -251,7 +251,7 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
     base = f"https://graph.facebook.com/{graph_version}/{page_id}"
 
     # 1) 基础字段（注意已去掉 age_restrictions/country_restrictions）
-    params = {"fields": "id,name,link,is_published"}
+    params = {"fields": "id,name,link,is_published,business{name}"}
     if had_token:
         params["access_token"] = access_token
 
@@ -259,6 +259,12 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
         resp = session.get(base, params=params, timeout=timeout)
         try:
             data = resp.json()
+        # 在 data = resp.json() 之后，加：
+            owner_name = None
+            if isinstance(data, dict):
+                b = data.get("business")
+                if isinstance(b, dict):
+                    owner_name = b.get("name")
         except Exception:
             data = None
 
@@ -346,6 +352,7 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
             "status": status,
             "normal": normal_flag,
             "name": (data or {}).get("name") if isinstance(data, dict) else None,
+            "owner_name": owner_name,  # ← 新增
             "link": (data or {}).get("link") if isinstance(data, dict) else None,
             "is_published": is_published,
             "age_restrictions": age_rest,
@@ -359,7 +366,7 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
     except requests.RequestException as e:
         return {
             "page_id": page_id, "http_status": None, "status": "NETWORK_ERROR", "normal": -1,
-            "name": None, "link": None, "checked_at": now_iso(),
+            "name": None, "owner_name": None, "link": None, "checked_at": now_iso(),
             "fb_error_code": None, "fb_error_message": str(e), "feed_hint": None,
         }
 
@@ -441,6 +448,13 @@ def check_pages_one_round():
         try: session.close()
         except: pass
 
+    def _pack_item(row: Dict[str, Any]) -> Dict[str, str]:
+        page_name = (row.get("name") or "").strip() or (row.get("label") or "").strip() or "(未知名称)"
+        owner = (row.get("owner_name") or "").strip() or "未知"
+        status = (row.get("status") or "").upper()
+        return {"name": page_name, "owner": owner, "status": status}
+
+
     # 三态写入文件：OK / UNPUBLISHED / NOT_FOUND
     # 另外：忽略类（年龄/国家墙）也按 OK 写入与计数
     tri_lines = []
@@ -465,20 +479,19 @@ def check_pages_one_round():
 
 
     # 确定异常（无 “- ” 前缀）
-    certain_ab_list = [
-        f"{_fmt_label_id(r)} | {(r.get('status') or '').upper()}"
-        for r in results
+    certain_ab_items = [
+        _pack_item(r) for r in results
         if r.get("label") and _bucket(r.get("status")) == "certain_abnormal"
     ]
 
     # 运行异常/权限类（有 “- ” 前缀由 push_summary 统一加，这里只给主体）
-    tech_issues_list = [
-        f"{_fmt_label_id(r)} | {(r.get('status') or '').upper()}"
-        for r in results
+
+    tech_issues_items = [
+        _pack_item(r) for r in results
         if r.get("label") and _bucket(r.get("status")) == "tech_exception"
     ]
 
-    return ok_count, certain_ab_list, total, tech_issues_list
+    return ok_count, certain_ab_items, total, tech_issues_items
 
 # ---------------- 飞书机器人（事件 + 发送） ----------------
 app = Flask(__name__)
@@ -546,12 +559,22 @@ def _target_chat_ids(preferred: Optional[str] = None):
             uniq.append(x); seen.add(x)
     return uniq
 
-def push_summary(round_name, ok, ab_labels, chat_id=None,
+#def push_summary(round_name, ok, ab_labels, chat_id=None,
+#                 started_at: datetime | None = None,
+#                 ended_at:   datetime | None = None,
+#                 duration_sec: int | None = None,
+#                 tech_issues: list[str] | None = None):
+    
+
+# 原：def push_summary(round_name, ok, ab_labels, ..., tech_issues: list[str] | None = None):
+def push_summary(round_name, ok, ab_items, chat_id=None,
                  started_at: datetime | None = None,
                  ended_at:   datetime | None = None,
                  duration_sec: int | None = None,
-                 tech_issues: list[str] | None = None):
-    tech_issues = tech_issues or []
+                 tech_items: list[dict] | None = None):
+    tech_items = tech_items or []
+
+#   tech_issues = tech_issues or []
     targets = _target_chat_ids(chat_id)
     title = f"【FB Page 监控】{round_name}"
 
@@ -570,28 +593,40 @@ def push_summary(round_name, ok, ab_labels, chat_id=None,
     lines.append(f"正常(OK)：{ok}")
 
     # 确定异常（无 “- ” 前缀）
-    if ab_labels:
-        lines.append(f"\n确定异常：{len(ab_labels)}")
-        lines += [x for x in ab_labels[:50]]
-        if len(ab_labels) > 50:
-            lines.append(f"... 还有 {len(ab_labels)-50} 条")
+    if ab_items:
+        lines.append(f"\n确定异常：{len(ab_items)}")
+        for it in ab_items[:50]:
+            nm = it.get("name") or "(未知名称)"
+            owner = it.get("owner") or "未知"
+            st = it.get("status") or "UNKNOWN"
+            lines.append(f"{nm}")
+            lines.append(f"{owner} | {st}")
+        if len(ab_items) > 50:
+            lines.append(f"... 还有 {len(ab_items)-50} 条")
 
     # 运行异常/权限类（有 “- ” 前缀）
-    if tech_issues:
-        lines.append(f"\n运行异常/权限类：{len(tech_issues)}")
-        lines += [f"- {x}" for x in tech_issues[:50]]
-        if len(tech_issues) > 50:
-            lines.append(f"... 还有 {len(tech_issues)-50} 条")
+# 新：
+    if tech_items:
+        lines.append(f"\n运行异常/权限类：{len(tech_items)}")
+        for it in tech_items[:50]:
+            nm = it.get("name") or "(未知名称)"
+            owner = it.get("owner") or "未知"
+            st = it.get("status") or "UNKNOWN"
+            lines.append(f"{nm}")
+            lines.append(f"{owner} | {st}")
+        if len(tech_items) > 50:
+            lines.append(f"... 还有 {len(tech_items)-50} 条")
+
 
     # 若两类都没有，按配置决定是否推送
-    if not ab_labels and not tech_issues and not CONFIG["FEISHU"]["push_on_no_abnormal"]:
+    if not ab_items and not tech_items and not CONFIG["FEISHU"]["push_on_no_abnormal"]:
         return
 
     msg = "\n".join(lines)
     for tgt in targets:
         _send_text(tgt, msg)
-    LAST_SUMMARY.update({"time": shown_time, "ok": ok, "ab": len(ab_labels), "source": round_name})
-    print(f"[PUSH] {round_name}: ok={ok} ab={len(ab_labels)} tech={len(tech_issues)} to={targets}")
+    LAST_SUMMARY.update({"time": shown_time, "ok": ok, "ab": len(ab_items), "source": round_name})
+    print(f"[PUSH] {round_name}: ok={ok} ab={len(ab_items)} tech={len(tech_items)} to={targets}")
 
 def _drain_manual():
     while MANUAL_PENDING.is_set():
@@ -681,13 +716,13 @@ def run_once_with_lock(source, chat_id, notify_start=False):
             _send_text(chat_id, "已开始执行，稍后回报结果")
 
         # 3) 一轮检测
-        ok, ab_labels, total, tech_issues = check_pages_one_round()
+        ok, ab_labels, total, tech_items = check_pages_one_round()
 
         # 4) 结束并推送
         end_wall = datetime.now(tz)
         duration = max(0, int(time.monotonic() - start_mono))
-        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_labels)} tech={len(tech_issues)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
-        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_issues)
+        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_labels)} tech={len(tech_items)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
+        push_summary(source, ok, ab_labels, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_issues=tech_items)
         return True
 
     except Exception as e:
