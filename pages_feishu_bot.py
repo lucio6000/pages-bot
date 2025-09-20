@@ -182,26 +182,48 @@ def now_local_str() -> str:
     tz = ZoneInfo(CONFIG["FEISHU"]["tz"])
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-def load_label_id_pairs(path: str) -> List[Tuple[str, str]]:
+def load_label_id_pairs(path: str) -> List[Tuple[str, str, str]]:
+    """
+    读取 pages.txt，支持两种格式：
+    - 新格式：name-pageID-ownedBy   （name / ownedBy 都允许包含连字符 `-` 和空格）
+    - 旧格式：name-pageID           （owner 将置为 '未知'）
+
+    返回三元组列表：(label, page_id, owner)
+    """
     if not os.path.exists(path):
         return []
-    pairs, seen = [], set()
-    # 支持标签中包含空格/连字符/中英文符号；匹配“...-<纯数字ID>”且 ID 在行尾（允许末尾有分隔符）
-    pat = re.compile(r"(.+?)-(\d{5,})\s*[,\s;，、]*$", re.UNICODE)
+    rows, seen = [], set()
+
+    # 新格式：以中间“纯数字 pageID”作为锚点，左右都用 .+? 捕获，允许包含 '-'
+    pat3 = re.compile(r"^\s*(.+?)-(\d{5,})-(.+?)\s*[,\s;，、]*$", re.UNICODE)
+
+    # 旧格式（无 owner）：同样只要求中间是纯数字 pageID
+    pat2 = re.compile(r"^\s*(.+?)-(\d{5,})\s*[,\s;，、]*$", re.UNICODE)
+
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            m = pat.search(s)
-            if not m:
-                continue
-            label = m.group(1).strip().rstrip(",;，、")
-            pid = m.group(2).strip()
+
+            m3 = pat3.match(s)
+            if m3:
+                label = m3.group(1).strip()
+                pid   = m3.group(2).strip()
+                owner = m3.group(3).strip()
+            else:
+                m2 = pat2.match(s)
+                if not m2:
+                    continue
+                label = m2.group(1).strip()
+                pid   = m2.group(2).strip()
+                owner = "未知"
+
             if pid not in seen:
                 seen.add(pid)
-                pairs.append((label, pid))
-    return pairs
+                rows.append((label, pid, owner))
+    return rows
+
 
 def build_session() -> requests.Session:
     fb = CONFIG["FB"]
@@ -441,13 +463,17 @@ def append_unique_lines(path: str, lines: List[str]):
 
 def check_pages_one_round():
     fb = CONFIG["FB"]
+
+    # 现在返回的是三元组 (label, page_id, owner)
     pairs = load_label_id_pairs(fb["MAPPING_FILE"])
     total = len(pairs)
     if total == 0:
         return 0, [], 0, []  # 无数据时四元组返回
 
     session = build_session()
-    id_to_label = {pid: label for (label, pid) in pairs}
+
+    # 记录 page_id -> (label, owner)，方便合并结果
+    id_to_meta = {pid: (label, owner) for (label, pid, owner) in pairs}
     results = []
 
     ex = ThreadPoolExecutor(max_workers=max(1, fb["CONCURRENCY"]))
@@ -456,8 +482,10 @@ def check_pages_one_round():
             probe_page, session, page_id, fb["GRAPH_VERSION"],
             fb["ACCESS_TOKEN"], fb["REQUEST_TIMEOUT"], fb["PROBE_FEED"]
         ): page_id
-        for _, page_id in pairs
+        for (_, page_id, _) in pairs
     }
+
+
 
     try:
         deadline = time.monotonic() + int(fb.get("ROUND_TIMEOUT", 180))
@@ -467,30 +495,50 @@ def check_pages_one_round():
         while pending:
             if CANCEL_EVENT.is_set():
                 for fut in pending:
-                    pid = futs[fut]; label = id_to_label.get(pid, "")
-                    results.append({"page_id": pid, "label": label, "status": "CANCELLED", "normal": -1, "checked_at": now_iso()})
+                    pid = futs[fut]
+                    label, owner = id_to_meta.get(pid, ("", "未知"))
+                    results.append({
+                        "page_id": pid, "label": label, "owner_name": owner,
+                        "status": "CANCELLED", "normal": -1, "checked_at": now_iso()
+                    })
                     print(f"[{now_local_str()}] ⚠️ (cancel) {label}-{pid} -> CANCELLED")
                 pending.clear()
                 break
 
             if time.monotonic() >= deadline:
                 for fut in pending:
-                    pid = futs[fut]; label = id_to_label.get(pid, "")
-                    results.append({"page_id": pid, "label": label, "status": "TIMEOUT", "normal": -1, "checked_at": now_iso()})
+                    pid = futs[fut]
+                    label, owner = id_to_meta.get(pid, ("", "未知"))
+                    results.append({
+                        "page_id": pid, "label": label, "owner_name": owner,
+                        "status": "TIMEOUT", "normal": -1, "checked_at": now_iso()
+                    })
                     print(f"[{now_local_str()}] ⚠️ (timeout) {label}-{pid} -> TIMEOUT")
                 pending.clear()
                 break
 
             done, pending = wait(pending, timeout=1.0)
             for fut in done:
-                pid = futs[fut]; label = id_to_label.get(pid, "")
+                pid = futs[fut]
+                label, owner = id_to_meta.get(pid, ("", "未知"))
                 try:
                     r = fut.result()
                 except Exception as e:
-                    r = {"page_id": pid, "status": "WORKER_ERROR", "normal": -1, "checked_at": now_iso(), "name": None, "fb_error_message": str(e)}
-                r["label"] = label; results.append(r)
+                    r = {
+                        "page_id": pid, "status": "WORKER_ERROR", "normal": -1,
+                        "checked_at": now_iso(), "name": None,
+                        "fb_error_message": str(e)
+                    }
+
+                # 合并：统一加上 label 和 owner（覆盖 probe_page 里可能返回的 business.name）
+                r["label"] = label
+                r["owner_name"] = owner
+                results.append(r)
+
                 done_idx += 1
-                tag = "✅" if (r.get("status") or "").upper() == "OK" else ("❌" if _bucket(r.get("status")) == "certain_abnormal" else "⚠️")
+                tag = "✅" if (r.get("status") or "").upper() == "OK" else (
+                    "❌" if _bucket(r.get("status")) == "certain_abnormal" else "⚠️"
+                )
                 nm = f" | {r.get('name')}" if r.get("name") else ""
                 extra = []
                 if r.get("age_restrictions"): extra.append(f"age={r['age_restrictions']}")
@@ -498,39 +546,14 @@ def check_pages_one_round():
                 suffix = f" [{', '.join(extra)}]" if extra else ""
                 print(f"[{now_local_str()}] {tag} ({done_idx}/{total}) {label}-{r['page_id']}{nm} -> {r.get('status')}{suffix}")
 
-
     finally:
-        # 结束线程池，但不要马上关 session；后面还要用它查 owner
         ex.shutdown(wait=False, cancel_futures=True)
-
-    # === 仅给“异常页”补齐 owner_name（减少额外 API 调用）===
-    # 异常：确定异常 + 运行异常/权限类；忽略类（年龄/国家墙）不查 Owner
-        abnormal_indexes = []
-        for idx, r in enumerate(results):
-            st = (r.get("status") or "").upper()
-            bucket = _bucket(st)
-            if bucket in ("certain_abnormal", "tech_exception"):
-                abnormal_indexes.append(idx)
-
-        if abnormal_indexes:
-            # 复用同一个 session；逐条给异常页补 owner_name（有缓存，不会重复查）
-            for idx in abnormal_indexes:
-                r = results[idx]
-                if not r.get("owner_name"):  # 只在缺失时查询
-                    owner = fetch_owner_name(
-                        session,
-                        r.get("page_id") or r.get("app_id"),
-                        fb["GRAPH_VERSION"],
-                        fb["ACCESS_TOKEN"],
-                        fb["REQUEST_TIMEOUT"],
-                    )
-                    r["owner_name"] = owner
-
-        # 到这里才关闭 session
+        # 注意：不再对异常页额外 fetch owner，此处可直接关掉 session
         try:
             session.close()
         except:
             pass
+
     
 
     def _pack_item(row: Dict[str, Any]) -> Dict[str, str]:
@@ -538,6 +561,7 @@ def check_pages_one_round():
         owner = (row.get("owner_name") or "").strip() or "未知"
         status = (row.get("status") or "").upper()
         return {"name": page_name, "owner": owner, "status": status}
+
 
 
     # 三态写入文件：OK / UNPUBLISHED / NOT_FOUND
