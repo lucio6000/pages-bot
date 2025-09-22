@@ -668,6 +668,25 @@ def _target_chat_ids(preferred: Optional[str] = None):
             uniq.append(x); seen.add(x)
     return uniq
 
+
+def _group_by_owner_status(items: list[dict]) -> list[tuple[str, str, int]]:
+    """
+    将 [{name, owner, status}, ...] 按 (owner, status) 分组，返回排序后的 (owner, status, count) 列表。
+    排序规则：count DESC，然后 owner ASC，然后 status ASC
+    """
+    from collections import defaultdict
+
+    counter = defaultdict(int)
+    for it in items:
+        owner = (it.get("owner") or "未知").strip() or "未知"
+        status = (it.get("status") or "UNKNOWN").strip().upper()
+        counter[(owner, status)] += 1
+
+    grouped = [ (owner, status, cnt) for (owner, status), cnt in counter.items() ]
+    grouped.sort(key=lambda x: (-x[2], x[0].lower(), x[1]))  # 数量降序，再 owner/status 升序
+    return grouped
+
+
 #def push_summary(round_name, ok, ab_labels, chat_id=None,
 #                 started_at: datetime | None = None,
 #                 ended_at:   datetime | None = None,
@@ -682,8 +701,6 @@ def push_summary(round_name, ok, ab_items, chat_id=None,
                  duration_sec: int | None = None,
                  tech_items: list[dict] | None = None):
     tech_items = tech_items or []
-
-#   tech_issues = tech_issues or []
     targets = _target_chat_ids(chat_id)
     title = f"【FB Page 监控】{round_name}"
 
@@ -698,34 +715,31 @@ def push_summary(round_name, ok, ab_items, chat_id=None,
         shown_time = now_local_str()
         lines.append(f"时间：{shown_time}")
 
-    # 统计行
+    # 总体统计
     lines.append(f"正常(OK)：{ok}")
 
-    # 确定异常（无 “- ” 前缀）
+    # ====== 确定异常：按 (Owner, Status) 分组展示 ======
     if ab_items:
-        lines.append(f"\n确定异常：{len(ab_items)}")
-        for it in ab_items[:50]:
-            nm = it.get("name") or "(未知名称)"
-            owner = it.get("owner") or "未知"
-            st = it.get("status") or "UNKNOWN"
-            lines.append(f"{nm}")
-            lines.append(f"{owner} | {st}")
-        if len(ab_items) > 50:
-            lines.append(f"... 还有 {len(ab_items)-50} 条")
+        lines.append(f"\n确定异常：{len(ab_items)}")  # 仍显示“页面条数”
+        groups = _group_by_owner_status(ab_items)
+        # 展示 Owner | Status | Count
+        for owner, status, cnt in groups[:100]:
+            owner_disp = owner or "未知"
+            status_disp = status or "UNKNOWN"
+            lines.append(f"{owner_disp} | {status_disp} | {cnt}")
+        if len(groups) > 100:
+            lines.append(f"... 还有 {len(groups)-100} 个分组")
 
-    # 运行异常/权限类（有 “- ” 前缀）
-# 新：
+    # ====== 运行异常/权限类：按 (Owner, Status) 分组展示 ======
     if tech_items:
-        lines.append(f"\n运行异常/权限类：{len(tech_items)}")
-        for it in tech_items[:50]:
-            nm = it.get("name") or "(未知名称)"
-            owner = it.get("owner") or "未知"
-            st = it.get("status") or "UNKNOWN"
-            lines.append(f"{nm}")
-            lines.append(f"{owner} | {st}")
-        if len(tech_items) > 50:
-            lines.append(f"... 还有 {len(tech_items)-50} 条")
-
+        lines.append(f"\n运行异常/权限类：{len(tech_items)}")  # 仍显示“页面条数”
+        groups2 = _group_by_owner_status(tech_items)
+        for owner, status, cnt in groups2[:100]:
+            owner_disp = owner or "未知"
+            status_disp = status or "UNKNOWN"
+            lines.append(f"{owner_disp} | {status_disp} | {cnt}")
+        if len(groups2) > 100:
+            lines.append(f"... 还有 {len(groups2)-100} 个分组")
 
     # 若两类都没有，按配置决定是否推送
     if not ab_items and not tech_items and not CONFIG["FEISHU"]["push_on_no_abnormal"]:
@@ -736,6 +750,7 @@ def push_summary(round_name, ok, ab_items, chat_id=None,
         _send_text(tgt, msg)
     LAST_SUMMARY.update({"time": shown_time, "ok": ok, "ab": len(ab_items), "source": round_name})
     print(f"[PUSH] {round_name}: ok={ok} ab={len(ab_items)} tech={len(tech_items)} to={targets}")
+
 
 def _drain_manual():
     while MANUAL_PENDING.is_set():
