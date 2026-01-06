@@ -7,7 +7,14 @@ Feishu 群机器人 + Facebook Page(粉丝页/主页) 监控（Render 版）
 - 年龄墙/国家墙：仅日志提示，不计入异常（并按 OK 写入结果文件）
 - “运行异常/权限类”：NEED_TOKEN/AUTH_ERROR/RATE_LIMIT/UNKNOWN/NETWORK_ERROR/TIMEOUT/CANCELLED/WORKER_ERROR
   在飞书推送中单独分区展示
-- ✅ 本版本新增：异常推送明细中展示 page_id + pages.txt 原始行信息
+
+✅ 本版本推送格式调整为：
+确定异常/运行异常：按 (Owner, Status) 分组
+每组输出：
+Owner | STATUS | Count
+page_id1
+page_id2
+(空行)
 """
 
 import os, re, json, time, threading, traceback
@@ -29,30 +36,30 @@ CONFIG = {
         "MAPPING_FILE": os.getenv("FB_PAGE_MAPPING_FILE", "pages.txt"),
         "CONCURRENCY": int(os.getenv("FB_CONCURRENCY", "6")),
         "GRAPH_VERSION": os.getenv("FB_GRAPH_VERSION", "v21.0"),
-        # 建议：System User 或 Page 的访问令牌；client_pages 场景会自动换 Page Token 读 /settings
         "ACCESS_TOKEN": os.getenv("FB_ACCESS_TOKEN"),
         "NEED_TOKEN_AS_NORMAL": os.getenv("FB_NEED_TOKEN_AS_NORMAL", "false").lower() == "true",
         "OUT_TXT": os.getenv("FB_OUT_TXT", "result_pages.txt"),
         "REQUEST_TIMEOUT": int(os.getenv("FB_REQUEST_TIMEOUT", "6")),
         "MAX_RETRIES": int(os.getenv("FB_MAX_RETRIES", "1")),
         "BACKOFF_FACTOR": float(os.getenv("FB_BACKOFF_FACTOR", "0.5")),
-        "ROUND_TIMEOUT": int(os.getenv("FB_ROUND_TIMEOUT", "180")),   # 整轮最多等待秒数
+        "ROUND_TIMEOUT": int(os.getenv("FB_ROUND_TIMEOUT", "180")),
         "FUTURE_EXTRA_GRACE": int(os.getenv("FB_FUTURE_EXTRA_GRACE", "2")),
-        # 是否额外探针访问 feed（用来侧写权限/墙）；没 token 时建议打开；有 token 也可保守关闭
         "PROBE_FEED": os.getenv("FB_PROBE_FEED", "true").lower() == "true",
     },
     "FEISHU": {
         "tz": os.getenv("BOT_TZ", "Asia/Shanghai"),
         "require_at": os.getenv("FEISHU_REQUIRE_AT", "true").lower() == "true",
-        "domain": os.getenv("FEISHU_DOMAIN", "feishu"),  # 中国区=feishu；国际=lark
+        "domain": os.getenv("FEISHU_DOMAIN", "feishu"),
         "app_id": os.getenv("FEISHU_APP_ID", ""),
         "app_secret": os.getenv("FEISHU_APP_SECRET", ""),
-        "verification_token": os.getenv("FEISHU_VERIFICATION_TOKEN", ""),  # 可留空
+        "verification_token": os.getenv("FEISHU_VERIFICATION_TOKEN", ""),
         "default_chat_id": os.getenv("FEISHU_DEFAULT_CHAT_ID", ""),
         "push_on_no_abnormal": os.getenv("FEISHU_PUSH_ON_NO_ABNORMAL", "false").lower() == "true",
         "max_text_len": int(os.getenv("FEISHU_MAX_TEXT_LEN", "1800")),
-        # ✅ 异常明细最多展示多少条（防止过长）
-        "detail_max_items": int(os.getenv("FEISHU_DETAIL_MAX_ITEMS", "80")),
+        # ✅ 每个分组最多展示多少个 page_id（防止刷屏）
+        "max_ids_per_group": int(os.getenv("FEISHU_MAX_IDS_PER_GROUP", "200")),
+        # ✅ 最多展示多少个分组（防止刷屏）
+        "max_groups": int(os.getenv("FEISHU_MAX_GROUPS", "200")),
     },
     "SERVER": {
         "host": "0.0.0.0",
@@ -65,11 +72,11 @@ CONFIG = {
 # ======================================================
 
 # =============== 状态分组常量 & 工具 ===============
-CERTAIN_ABNORMAL = {"UNPUBLISHED", "NOT_FOUND"}    # 确定异常（会计入“确定异常 清单”）
+CERTAIN_ABNORMAL = {"UNPUBLISHED", "NOT_FOUND"}
 TECH_EXCEPTIONS  = {"NEED_TOKEN", "AUTH_ERROR", "RATE_LIMIT", "UNKNOWN",
-                    "NETWORK_ERROR", "TIMEOUT", "CANCELLED", "WORKER_ERROR"}  # 运行/权限/网络类（单独分区）
-IGNORED_STATUSES = {"RESTRICTED_AGE", "RESTRICTED_COUNTRY"}  # 年龄墙/国家墙：仅日志提示
-RESULT_KEEP_STATUSES = {"OK", "UNPUBLISHED", "NOT_FOUND"}    # 仅这三态写入结果文件
+                    "NETWORK_ERROR", "TIMEOUT", "CANCELLED", "WORKER_ERROR"}
+IGNORED_STATUSES = {"RESTRICTED_AGE", "RESTRICTED_COUNTRY"}
+RESULT_KEEP_STATUSES = {"OK", "UNPUBLISHED", "NOT_FOUND"}
 
 def _bucket(status: str) -> str:
     s = (status or "").upper()
@@ -80,18 +87,11 @@ def _bucket(status: str) -> str:
     return "other"
 
 def _fmt_label_id(r: Dict[str, Any]) -> str:
-    """输出 Label-1234567890；兼容 page_id/app_id 字段"""
     label = (r.get("label") or "").strip()
     rid = r.get("page_id") or r.get("app_id") or ""
     return f"{label}-{rid}".strip("-")
 
-def is_abnormal(row: Dict[str, Any]) -> bool:
-    s = (row.get("status") or "").upper()
-    return s in CERTAIN_ABNORMAL or s in TECH_EXCEPTIONS
-# ======================================================
-
 # 线程安全
-print_lock = threading.Lock()
 file_lock = threading.Lock()
 
 # ---- Feishu 事件去重缓存 ----
@@ -106,11 +106,11 @@ PENDING_CHAT_ID = None
 
 # 执行互斥/状态
 RUN_MUTEX = threading.Lock()
-RUN_ACTIVE = threading.Event()      # 正在执行一轮
-RUN_START_AT = 0.0                  # monotonic
-RUN_SOURCE = ""                     # '手动执行' / '周期执行'
-RUN_HOLDER = ""                     # "{source}::{thread-name}"
-LOCK_STUCK_SINCE = 0.0              # 卡锁起始时间
+RUN_ACTIVE = threading.Event()
+RUN_START_AT = 0.0
+RUN_SOURCE = ""
+RUN_HOLDER = ""
+LOCK_STUCK_SINCE = 0.0
 
 # 人工中止当前轮
 CANCEL_EVENT = threading.Event()
@@ -119,9 +119,7 @@ def _holder() -> str:
     return RUN_HOLDER or "<none>"
 
 def _run_elapsed_sec() -> int:
-    if not RUN_ACTIVE.is_set():
-        return 0
-    if RUN_START_AT <= 0:
+    if not RUN_ACTIVE.is_set() or RUN_START_AT <= 0:
         return 0
     return int(time.monotonic() - RUN_START_AT)
 
@@ -129,7 +127,6 @@ def _lock_stuck_for() -> float:
     return 0.0 if LOCK_STUCK_SINCE == 0.0 else (time.monotonic() - LOCK_STUCK_SINCE)
 
 def _try_unstick_mutex(force: bool = False) -> bool:
-    """卡锁/脏锁自愈：支持非执行态和执行态两种场景；force=True 时无条件重置"""
     global RUN_MUTEX, LOCK_STUCK_SINCE
     now = time.monotonic()
     limit = CONFIG["FB"]["ROUND_TIMEOUT"] + CONFIG["FB"]["FUTURE_EXTRA_GRACE"]
@@ -144,7 +141,6 @@ def _try_unstick_mutex(force: bool = False) -> bool:
         LOCK_STUCK_SINCE = 0.0
         return True
 
-    # 情况 A：锁被占用但不在执行态
     if RUN_MUTEX.locked() and not RUN_ACTIVE.is_set():
         if LOCK_STUCK_SINCE == 0.0:
             LOCK_STUCK_SINCE = now
@@ -161,7 +157,6 @@ def _try_unstick_mutex(force: bool = False) -> bool:
     else:
         LOCK_STUCK_SINCE = 0.0
 
-    # 情况 B：锁被占用且在执行态，但执行时长明显超时 → 直接强制复位
     if RUN_MUTEX.locked() and RUN_ACTIVE.is_set():
         start_at = RUN_START_AT or 0.0
         elapsed = now - start_at if start_at > 0 else now
@@ -185,48 +180,42 @@ def now_local_str() -> str:
     tz = ZoneInfo(CONFIG["FEISHU"]["tz"])
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
-def load_label_id_pairs(path: str) -> List[Tuple[str, str, str, str]]:
+def load_label_id_pairs(path: str) -> List[Tuple[str, str, str]]:
     """
-    读取 pages.txt，支持两种格式：
-    - 新格式：name-pageID-ownedBy   （name / ownedBy 都允许包含连字符 `-` 和空格）
-    - 旧格式：name-pageID           （owner 将置为 '未知'）
-
-    ✅ 本版本新增：返回 raw_line（即 pages.txt 原始行信息）
-    返回四元组列表：(label, page_id, owner, raw_line)
+    读取 pages.txt，支持：
+    - 新格式：name-pageID-ownedBy
+    - 旧格式：name-pageID（owner='未知'）
+    返回：(label, page_id, owner)
     """
     if not os.path.exists(path):
         return []
     rows, seen = [], set()
-
     pat3 = re.compile(r"^\s*(.+?)-(\d{5,})-(.+?)\s*[,\s;，、]*$", re.UNICODE)
     pat2 = re.compile(r"^\s*(.+?)-(\d{5,})\s*[,\s;，、]*$", re.UNICODE)
 
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
-            raw = line.strip()
-            if not raw or raw.startswith("#"):
+            s = line.strip()
+            if not s or s.startswith("#"):
                 continue
 
-            m3 = pat3.match(raw)
+            m3 = pat3.match(s)
             if m3:
                 label = m3.group(1).strip()
                 pid   = m3.group(2).strip()
                 owner = m3.group(3).strip()
-                raw_line = f"{label}-{pid}-{owner}"  # 规整化（保留原含义）
             else:
-                m2 = pat2.match(raw)
+                m2 = pat2.match(s)
                 if not m2:
                     continue
                 label = m2.group(1).strip()
                 pid   = m2.group(2).strip()
                 owner = "未知"
-                raw_line = f"{label}-{pid}"  # 旧格式
 
             if pid not in seen:
                 seen.add(pid)
-                rows.append((label, pid, owner, raw_line))
+                rows.append((label, pid, owner))
     return rows
-
 
 def build_session() -> requests.Session:
     fb = CONFIG["FB"]
@@ -240,11 +229,10 @@ def build_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retries, pool_connections=200, pool_maxsize=200)
     sess.mount("https://", adapter)
-    sess.headers.update({"User-Agent": "fb-page-feishu-bot/1.2"})
+    sess.headers.update({"User-Agent": "fb-page-feishu-bot/1.3"})
     return sess
 
 def classify_page_status(http_status: int, payload: Optional[Dict[str, Any]], had_token: bool, need_token_as_normal: bool) -> Tuple[str, int]:
-    """返回 (status, normal_flag)；normal_flag: 1正常/0确定异常/-1未知/临时失败"""
     if http_status == 200 and isinstance(payload, dict) and payload.get("id"):
         return "OK", 1
 
@@ -260,18 +248,12 @@ def classify_page_status(http_status: int, payload: Optional[Dict[str, Any]], ha
         if not had_token:
             return "NEED_TOKEN", (1 if need_token_as_normal else -1)
         return "AUTH_ERROR", -1
-
     if http_status is None:
         return "NETWORK_ERROR", -1
-
     return "UNKNOWN", -1
 
 def probe_page(session: requests.Session, page_id: str, graph_version: str,
                access_token: Optional[str], timeout: int, probe_feed: bool) -> Dict[str, Any]:
-    """
-    读取 Page 基础字段；再读 /settings 拿年龄/国家墙。
-    若用 System User Token 访问 /settings 返回 #200，则自动用 SU 换 Page Token 再试一次。
-    """
     had_token = bool(access_token)
     base = f"https://graph.facebook.com/{graph_version}/{page_id}"
 
@@ -283,14 +265,8 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
         resp = session.get(base, params=params, timeout=timeout)
         try:
             data = resp.json()
-            owner_name = None
-            if isinstance(data, dict):
-                b = data.get("business")
-                if isinstance(b, dict):
-                    owner_name = b.get("name")
         except Exception:
             data = None
-            owner_name = None
 
         age_rest = None
         country_rest = None
@@ -372,7 +348,6 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
             "status": status,
             "normal": normal_flag,
             "name": (data or {}).get("name") if isinstance(data, dict) else None,
-            "owner_name": owner_name,
             "link": (data or {}).get("link") if isinstance(data, dict) else None,
             "is_published": is_published,
             "age_restrictions": age_rest,
@@ -386,19 +361,21 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
     except requests.RequestException as e:
         return {
             "page_id": page_id, "http_status": None, "status": "NETWORK_ERROR", "normal": -1,
-            "name": None, "owner_name": None, "link": None, "checked_at": now_iso(),
+            "name": None, "link": None, "checked_at": now_iso(),
             "fb_error_code": None, "fb_error_message": str(e), "feed_hint": None,
         }
 
 def append_unique_lines(path: str, lines: List[str]):
-    if not lines: return
+    if not lines:
+        return
     with file_lock:
         existed = set()
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 for ln in f:
                     s = ln.strip()
-                    if s: existed.add(s)
+                    if s:
+                        existed.add(s)
         with open(path, "a", encoding="utf-8") as f:
             for s in lines:
                 if s not in existed:
@@ -406,8 +383,6 @@ def append_unique_lines(path: str, lines: List[str]):
 
 def check_pages_one_round():
     fb = CONFIG["FB"]
-
-    # 现在返回的是四元组 (label, page_id, owner, raw_line)
     pairs = load_label_id_pairs(fb["MAPPING_FILE"])
     total = len(pairs)
     if total == 0:
@@ -415,21 +390,17 @@ def check_pages_one_round():
 
     session = build_session()
 
-    # ✅ page_id -> meta
-    id_to_meta = {
-        pid: {"label": label, "owner": owner, "raw_line": raw_line}
-        for (label, pid, owner, raw_line) in pairs
-    }
-
+    # page_id -> (label, owner)
+    id_to_meta = {pid: (label, owner) for (label, pid, owner) in pairs}
     results = []
-    ex = ThreadPoolExecutor(max_workers=max(1, fb["CONCURRENCY"]))
 
+    ex = ThreadPoolExecutor(max_workers=max(1, fb["CONCURRENCY"]))
     futs = {
         ex.submit(
             probe_page, session, page_id, fb["GRAPH_VERSION"],
             fb["ACCESS_TOKEN"], fb["REQUEST_TIMEOUT"], fb["PROBE_FEED"]
         ): page_id
-        for (_, page_id, _, _) in pairs
+        for (_, page_id, _) in pairs
     }
 
     try:
@@ -441,43 +412,39 @@ def check_pages_one_round():
             if CANCEL_EVENT.is_set():
                 for fut in pending:
                     pid = futs[fut]
-                    meta = id_to_meta.get(pid, {"label": "", "owner": "未知", "raw_line": ""})
+                    label, owner = id_to_meta.get(pid, ("", "未知"))
                     results.append({
                         "page_id": pid,
-                        "label": meta["label"],
-                        "owner_name": meta["owner"],
-                        "page_line": meta["raw_line"],
+                        "label": label,
+                        "owner_name": owner,
                         "status": "CANCELLED",
                         "normal": -1,
                         "checked_at": now_iso()
                     })
-                    print(f"[{now_local_str()}] ⚠️ (cancel) {meta['label']}-{pid} -> CANCELLED")
+                    print(f"[{now_local_str()}] ⚠️ (cancel) {label}-{pid} -> CANCELLED")
                 pending.clear()
                 break
 
             if time.monotonic() >= deadline:
                 for fut in pending:
                     pid = futs[fut]
-                    meta = id_to_meta.get(pid, {"label": "", "owner": "未知", "raw_line": ""})
+                    label, owner = id_to_meta.get(pid, ("", "未知"))
                     results.append({
                         "page_id": pid,
-                        "label": meta["label"],
-                        "owner_name": meta["owner"],
-                        "page_line": meta["raw_line"],
+                        "label": label,
+                        "owner_name": owner,
                         "status": "TIMEOUT",
                         "normal": -1,
                         "checked_at": now_iso()
                     })
-                    print(f"[{now_local_str()}] ⚠️ (timeout) {meta['label']}-{pid} -> TIMEOUT")
+                    print(f"[{now_local_str()}] ⚠️ (timeout) {label}-{pid} -> TIMEOUT")
                 pending.clear()
                 break
 
             done, pending = wait(pending, timeout=1.0)
             for fut in done:
                 pid = futs[fut]
-                meta = id_to_meta.get(pid, {"label": "", "owner": "未知", "raw_line": ""})
-                label, owner, raw_line = meta["label"], meta["owner"], meta["raw_line"]
-
+                label, owner = id_to_meta.get(pid, ("", "未知"))
                 try:
                     r = fut.result()
                 except Exception as e:
@@ -487,11 +454,9 @@ def check_pages_one_round():
                         "fb_error_message": str(e)
                     }
 
-                # ✅ 合并 meta：label/owner/page_line 以 pages.txt 为准
+                # 统一加上 label + owner（以 pages.txt 为准）
                 r["label"] = label
                 r["owner_name"] = owner
-                r["page_line"] = raw_line
-
                 results.append(r)
 
                 done_idx += 1
@@ -513,21 +478,12 @@ def check_pages_one_round():
             pass
 
     def _pack_item(row: Dict[str, Any]) -> Dict[str, str]:
-        page_name = (row.get("name") or "").strip() or (row.get("label") or "").strip() or "(未知名称)"
         owner = (row.get("owner_name") or "").strip() or "未知"
         status = (row.get("status") or "").upper()
         page_id = (row.get("page_id") or "").strip()
-        page_line = (row.get("page_line") or "").strip()
-        return {
-            "name": page_name,
-            "owner": owner,
-            "status": status,
-            "page_id": page_id,
-            "page_line": page_line,
-        }
+        return {"owner": owner, "status": status, "page_id": page_id}
 
-    # 三态写入文件：OK / UNPUBLISHED / NOT_FOUND
-    # 忽略类（年龄/国家墙）按 OK 写入
+    # 三态写入文件
     tri_lines = []
     for r in results:
         st = (r.get("status") or "").upper()
@@ -551,12 +507,12 @@ def check_pages_one_round():
         if r.get("label") and _bucket(r.get("status")) == "certain_abnormal"
     ]
 
-    tech_issues_items = [
+    tech_items = [
         _pack_item(r) for r in results
         if r.get("label") and _bucket(r.get("status")) == "tech_exception"
     ]
 
-    return ok_count, certain_ab_items, total, tech_issues_items
+    return ok_count, certain_ab_items, total, tech_items
 
 # ---------------- 飞书机器人（事件 + 发送） ----------------
 app = Flask(__name__)
@@ -584,7 +540,8 @@ def _get_tenant_access_token() -> Optional[str]:
 
 def _send_text(chat_id: str, text: str):
     token = _get_tenant_access_token()
-    if not token or not chat_id: return
+    if not token or not chat_id:
+        return
     url = _feishu_base() + "/open-apis/im/v1/messages?receive_id_type=chat_id"
     maxlen = CONFIG["FEISHU"]["max_text_len"]
     chunks = [text[i:i+maxlen] for i in range(0, len(text), maxlen)] or [text]
@@ -605,7 +562,7 @@ def test_send():
         _send_text(cid, "测试：Page 机器人发消息 OK")
         return "sent", 200
     except Exception as e:
-        return (f"send failed: {e}", 500)
+        return (f"send failed: {e}"), 500
 
 def _target_chat_ids(preferred: Optional[str] = None):
     if preferred:
@@ -614,53 +571,52 @@ def _target_chat_ids(preferred: Optional[str] = None):
     ids = [x.strip() for x in re.split(r"[,\s;]+", ids_env) if x.strip()]
     if not ids:
         one = os.getenv("FEISHU_DEFAULT_CHAT_ID") or CONFIG["FEISHU"].get("default_chat_id", "")
-        if one: ids = [one]
+        if one:
+            ids = [one]
     global CURRENT_CHAT_ID
     if not ids and CURRENT_CHAT_ID:
         ids = [CURRENT_CHAT_ID]
     uniq, seen = [], set()
     for x in ids:
         if x and x not in seen:
-            uniq.append(x); seen.add(x)
+            uniq.append(x)
+            seen.add(x)
     return uniq
 
-def _group_by_owner_status(items: list[dict]) -> list[tuple[str, str, int]]:
+def _group_owner_status_to_ids(items: list[dict]) -> list[tuple[str, str, list[str]]]:
     """
-    将 [{name, owner, status, page_id, page_line}, ...] 按 (owner, status) 分组
+    items: [{owner,status,page_id}, ...]
+    返回：[(owner,status,[page_id...]), ...]
+    排序：count DESC, owner ASC, status ASC
     """
     from collections import defaultdict
-    counter = defaultdict(int)
+    mp = defaultdict(list)
     for it in items:
         owner = (it.get("owner") or "未知").strip() or "未知"
         status = (it.get("status") or "UNKNOWN").strip().upper()
-        counter[(owner, status)] += 1
-    grouped = [(owner, status, cnt) for (owner, status), cnt in counter.items()]
-    grouped.sort(key=lambda x: (-x[2], x[0].lower(), x[1]))
+        pid = (it.get("page_id") or "").strip()
+        if pid:
+            mp[(owner, status)].append(pid)
+
+    grouped = []
+    for (owner, status), ids in mp.items():
+        # 去重 + 排序，让输出稳定
+        uniq_ids = sorted(set(ids))
+        grouped.append((owner, status, uniq_ids))
+
+    grouped.sort(key=lambda x: (-len(x[2]), x[0].lower(), x[1]))
     return grouped
 
-def _format_detail_lines(items: list[dict], max_items: int) -> list[str]:
-    """
-    ✅ 将异常 item 列成明细行：STATUS | page_id | page_line
-    其中 page_line 是 pages.txt 对应行信息（规整化后）
-    """
-    if not items:
-        return []
-    # 稳定排序：status -> owner -> page_id
-    items_sorted = sorted(items, key=lambda x: ((x.get("status") or ""), (x.get("owner") or ""), (x.get("page_id") or "")))
-    out = []
-    for it in items_sorted[:max_items]:
-        st = (it.get("status") or "UNKNOWN").upper()
-        pid = it.get("page_id") or ""
-        pline = it.get("page_line") or ""
-        if not pline:
-            # 兜底：用 label-id-owner 拼一个也行
-            nm = (it.get("name") or "").strip()
-            owner = (it.get("owner") or "未知").strip()
-            pline = f"{nm}-{pid}-{owner}".strip("-")
-        out.append(f"{st} | {pid} | {pline}")
-    if len(items_sorted) > max_items:
-        out.append(f"... 还有 {len(items_sorted) - max_items} 条未展示（可调 FEISHU_DETAIL_MAX_ITEMS）")
-    return out
+def _append_group_block(lines: list[str], owner: str, status: str, ids: list[str],
+                        max_ids: int):
+    owner_disp = owner or "未知"
+    status_disp = status or "UNKNOWN"
+    lines.append(f"{owner_disp} | {status_disp} | {len(ids)}")
+    shown = ids[:max_ids]
+    lines.extend(shown)
+    if len(ids) > max_ids:
+        lines.append(f"... 还有 {len(ids) - max_ids} 个 page_id 未展示（可调 FEISHU_MAX_IDS_PER_GROUP）")
+    lines.append("")  # 组间空行
 
 def push_summary(round_name, ok, ab_items, chat_id=None,
                  started_at: datetime | None = None,
@@ -677,45 +633,40 @@ def push_summary(round_name, ok, ab_items, chat_id=None,
             f"开始：{started_at.strftime('%Y-%m-%d %H:%M:%S')}",
             f"结束：{ended_at.strftime('%Y-%m-%d %H:%M:%S')}（耗时{duration_sec or 0}s）",
         ]
-        shown_time = ended_at.strftime('%Y-%m-%d %H:%M:%S')
+        shown_time = ended_at.strftime("%Y-%m-%d %H:%M:%S")
     else:
         shown_time = now_local_str()
         lines.append(f"时间：{shown_time}")
 
     lines.append(f"正常(OK)：{ok}")
+    lines.append("")  # 空行
 
-    detail_max = int(CONFIG["FEISHU"].get("detail_max_items", 80))
+    max_ids = int(CONFIG["FEISHU"]["max_ids_per_group"])
+    max_groups = int(CONFIG["FEISHU"]["max_groups"])
 
     # ====== 确定异常 ======
     if ab_items:
-        lines.append(f"\n确定异常：{len(ab_items)}")
-        groups = _group_by_owner_status(ab_items)
-        for owner, status, cnt in groups[:100]:
-            lines.append(f"{owner or '未知'} | {status or 'UNKNOWN'} | {cnt}")
-        if len(groups) > 100:
-            lines.append(f"... 还有 {len(groups)-100} 个分组")
-
-        # ✅ 明细
-        lines.append("\n确定异常明细（STATUS | page_id | pages.txt行）：")
-        lines.extend(_format_detail_lines(ab_items, detail_max))
-
+        lines.append(f"确定异常：{len(ab_items)}")
+        groups = _group_owner_status_to_ids(ab_items)
+        for i, (owner, status, ids) in enumerate(groups[:max_groups], start=1):
+            _append_group_block(lines, owner, status, ids, max_ids)
+        if len(groups) > max_groups:
+            lines.append(f"... 还有 {len(groups) - max_groups} 个分组未展示（可调 FEISHU_MAX_GROUPS）")
+            lines.append("")
     # ====== 运行异常/权限类 ======
     if tech_items:
-        lines.append(f"\n运行异常/权限类：{len(tech_items)}")
-        groups2 = _group_by_owner_status(tech_items)
-        for owner, status, cnt in groups2[:100]:
-            lines.append(f"{owner or '未知'} | {status or 'UNKNOWN'} | {cnt}")
-        if len(groups2) > 100:
-            lines.append(f"... 还有 {len(groups2)-100} 个分组")
-
-        # ✅ 明细
-        lines.append("\n运行异常/权限类明细（STATUS | page_id | pages.txt行）：")
-        lines.extend(_format_detail_lines(tech_items, detail_max))
+        lines.append(f"运行异常/权限类：{len(tech_items)}")
+        groups2 = _group_owner_status_to_ids(tech_items)
+        for i, (owner, status, ids) in enumerate(groups2[:max_groups], start=1):
+            _append_group_block(lines, owner, status, ids, max_ids)
+        if len(groups2) > max_groups:
+            lines.append(f"... 还有 {len(groups2) - max_groups} 个分组未展示（可调 FEISHU_MAX_GROUPS）")
+            lines.append("")
 
     if not ab_items and not tech_items and not CONFIG["FEISHU"]["push_on_no_abnormal"]:
         return
 
-    msg = "\n".join(lines)
+    msg = "\n".join(lines).rstrip()  # 末尾去掉多余空行
     for tgt in targets:
         _send_text(tgt, msg)
     LAST_SUMMARY.update({"time": shown_time, "ok": ok, "ab": len(ab_items), "source": round_name})
@@ -745,38 +696,33 @@ def monitor_loop():
         if RUN_FLAG.is_set() and MANUAL_PENDING.is_set():
             _drain_manual()
 
-def clean_text(s: str) -> str:
-    if not s: return ""
-    s = re.sub(r"<at[^>]*?>.*?</at>", "", s, flags=re.I | re.S)
-    s = re.sub(r"@_user_\d+\s*", "", s)
-    s = s.replace("\u2005", " ").replace("\u200B", "")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
 def _seen_event(event_id: str = None, message_id: str = None) -> bool:
     key = event_id or message_id
-    if not key: return False
+    if not key:
+        return False
     now = time.time()
     with _event_lock:
         cutoff = now - EVENT_CACHE_TTL
         for k, ts in list(_EVENT_CACHE.items()):
-            if ts < cutoff: _EVENT_CACHE.pop(k, None)
-            else: break
-        if key in _EVENT_CACHE: return True
+            if ts < cutoff:
+                _EVENT_CACHE.pop(k, None)
+            else:
+                break
+        if key in _EVENT_CACHE:
+            return True
         _EVENT_CACHE[key] = now
         if len(_EVENT_CACHE) > 2000:
             _EVENT_CACHE.popitem(last=False)
         return False
 
-CMD_COOLDOWN_SEC = int(os.getenv("FEISHU_CMD_COOLDOWN_SECONDS", "8"))
-_last_cmd_at = {}
-_cmd_lock = threading.Lock()
-def _cooldown_ok(chat_id: str, cmd: str) -> bool:
-    now = time.time(); key = f"{chat_id}:{cmd}"
-    with _cmd_lock:
-        last = _last_cmd_at.get(key, 0)
-        if now - last < CMD_COOLDOWN_SEC: return False
-        _last_cmd_at[key] = now; return True
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"<at[^>]*?>.*?</at>", "", s, flags=re.I | re.S)
+    s = re.sub(r"@_user_\d+\s*", "", s)
+    s = s.replace("\u2005", " ").replace("\u200B", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def run_once_with_lock(source, chat_id, notify_start=False):
     if not RUN_MUTEX.acquire(blocking=False):
@@ -809,13 +755,17 @@ def run_once_with_lock(source, chat_id, notify_start=False):
 
         end_wall = datetime.now(tz)
         duration = max(0, int(time.monotonic() - start_mono))
-        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_items)} tech={len(tech_items)} start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
-        push_summary(source, ok, ab_items, chat_id=chat_id, started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_items=tech_items)
+        print(f"[RUN] end {source}: total={total} ok={ok} ab={len(ab_items)} tech={len(tech_items)} "
+              f"start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
+
+        push_summary(source, ok, ab_items, chat_id=chat_id,
+                     started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_items=tech_items)
         return True
 
     except Exception as e:
         traceback.print_exc()
-        if chat_id: _send_text(chat_id, f"{source}失败：{e}")
+        if chat_id:
+            _send_text(chat_id, f"{source}失败：{e}")
         return False
 
     finally:
@@ -863,20 +813,25 @@ def feishu_events():
     content_raw, mentions, chat_type = "{}", [], "group"
 
     if data.get("schema") == "2.0" and (data.get("header") or {}).get("event_type") == "im.message.receive_v1":
-        ev, msg = data.get("event", {}) or {}, (data.get("event", {}) or {}).get("message", {}) or {}
+        msg = (data.get("event", {}) or {}).get("message", {}) or {}
         message_id = msg.get("message_id"); chat_id = msg.get("chat_id")
         chat_type = msg.get("chat_type") or "group"; mentions = msg.get("mentions") or []
         content_raw = msg.get("content") or "{}"
-        try: text = json.loads(content_raw).get("text", "")
-        except Exception as e: print("[EVENT] parse content error:", e, content_raw)
+        try:
+            text = json.loads(content_raw).get("text", "")
+        except Exception as e:
+            print("[EVENT] parse content error:", e, content_raw)
     else:
-        ev, msg = data.get("event", {}) or {}, (data.get("event", {}) or {}).get("message", {}) or {}
+        ev = data.get("event", {}) or {}
+        msg = ev.get("message", {}) or {}
         event_id = event_id or ev.get("uuid") or msg.get("message_id")
         message_id = msg.get("message_id"); chat_id = msg.get("chat_id")
         chat_type = msg.get("chat_type") or "group"; mentions = msg.get("mentions") or []
         content = msg.get("content") or "{}"
-        try: text = json.loads(content).get("text", "")
-        except Exception as e: print("[EVENT] parse content error (legacy):", e, content)
+        try:
+            text = json.loads(content).get("text", "")
+        except Exception as e:
+            print("[EVENT] parse content error (legacy):", e, content)
 
     if _seen_event(event_id=event_id, message_id=message_id):
         print(f"[DEDUP] drop event_id={event_id} message_id={message_id}")
@@ -897,6 +852,7 @@ def feishu_events():
         return jsonify({"code": 0})
 
     text = clean_text(text)
+
     def _norm_cmd(s: str) -> str:
         return re.sub(r"[。.!！]+$", "", s.strip())
 
@@ -908,33 +864,29 @@ def feishu_events():
 
     if cmd in ("chatid", "群id", "群ID"):
         _send_text(chat_id, f"chat_id: {chat_id}")
-        print(f"[REPLY] chatid -> {chat_id}")
 
     elif cmd in ("执行", "立即执行") or cmd_l == "run":
         def _try_now():
             ok = run_once_with_lock("手动执行", chat_id, notify_start=True)
             if not ok:
                 global PENDING_CHAT_ID
-                with _pending_lock: PENDING_CHAT_ID = chat_id
+                with _pending_lock:
+                    PENDING_CHAT_ID = chat_id
                 MANUAL_PENDING.set()
-                print(f"[PENDING] queued manual for chat={chat_id}")
                 _send_text(chat_id, "当前正在执行，本轮结束后将立即补跑一次")
         threading.Thread(target=_try_now, daemon=True).start()
-        print("[REPLY] manual requested")
 
     elif cmd in ("开始", "start"):
         if not RUN_FLAG.is_set():
             RUN_FLAG.set()
             threading.Thread(target=monitor_loop, daemon=True).start()
             _send_text(chat_id, f"监控已启动（间隔 {CONFIG['SCHEDULE']['interval_seconds']}s）")
-            print("[REPLY] monitoring started")
         else:
             _send_text(chat_id, "监控已在运行中")
 
     elif cmd in ("暂停", "停止", "stop"):
         RUN_FLAG.clear()
         _send_text(chat_id, "监控已暂停")
-        print("[REPLY] monitoring paused")
 
     elif cmd in ("中止", "取消本轮", "abort", "cancel"):
         if RUN_ACTIVE.is_set():
@@ -947,7 +899,6 @@ def feishu_events():
             if RUN_MUTEX.locked():
                 _try_unstick_mutex(force=True)
                 _send_text(chat_id, "未及时释放，已强制解锁")
-            print("[REPLY] abort current round (with watchdog)")
         else:
             if RUN_MUTEX.locked():
                 _try_unstick_mutex(force=True)
@@ -960,12 +911,14 @@ def feishu_events():
             CANCEL_EVENT.set()
             _send_text(chat_id, "已请求中止当前轮，准备抢占执行…")
             for _ in range(5):
-                if not RUN_MUTEX.locked(): break
+                if not RUN_MUTEX.locked():
+                    break
                 time.sleep(1)
             ok = run_once_with_lock("手动执行", chat_id, notify_start=True)
             if not ok:
                 global PENDING_CHAT_ID
-                with _pending_lock: PENDING_CHAT_ID = chat_id
+                with _pending_lock:
+                    PENDING_CHAT_ID = chat_id
                 MANUAL_PENDING.set()
                 _send_text(chat_id, "当前仍在释放中，已加入队列，稍后自动补跑")
         threading.Thread(target=_force, daemon=True).start()
@@ -975,25 +928,20 @@ def feishu_events():
         _send_text(chat_id, f"已强制重置互斥锁（holder={_holder()}）")
 
     elif cmd in ("状态", "status"):
-        try:
-            running   = RUN_FLAG.is_set()
-            executing = RUN_ACTIVE.is_set()
-            locked    = RUN_MUTEX.locked()
-            elapsed   = _run_elapsed_sec() if executing else 0
-            src       = RUN_SOURCE or "无"
-            holder    = _holder()
-            lines = [
-                f"运行：{running}",
-                f"执行中：{executing}（来源：{src}，已耗时 {elapsed}s）",
-                f"锁占用：{locked}（持有者：{holder}）",
-                f"间隔：{CONFIG['SCHEDULE']['interval_seconds']}s",
-                f"上次：{LAST_SUMMARY.get('time') or '无'}（OK={LAST_SUMMARY.get('ok',0)}, AB={LAST_SUMMARY.get('ab',0)}）",
-            ]
-            _send_text(chat_id, "\n".join(lines))
-            print(f"[STATUS] running={running} executing={executing} locked={locked} holder={holder} elapsed={elapsed}s")
-        except Exception as e:
-            traceback.print_exc()
-            _send_text(chat_id, f"状态查询失败：{e}")
+        running = RUN_FLAG.is_set()
+        executing = RUN_ACTIVE.is_set()
+        locked = RUN_MUTEX.locked()
+        elapsed = _run_elapsed_sec() if executing else 0
+        src = RUN_SOURCE or "无"
+        holder = _holder()
+        lines = [
+            f"运行：{running}",
+            f"执行中：{executing}（来源：{src}，已耗时 {elapsed}s）",
+            f"锁占用：{locked}（持有者：{holder}）",
+            f"间隔：{CONFIG['SCHEDULE']['interval_seconds']}s",
+            f"上次：{LAST_SUMMARY.get('time') or '无'}（OK={LAST_SUMMARY.get('ok',0)}, AB={LAST_SUMMARY.get('ab',0)}）",
+        ]
+        _send_text(chat_id, "\n".join(lines))
 
     else:
         m = re.match(r"^(?:间隔|interval)\s*=\s*(\d+)$", cmd_l)
@@ -1002,11 +950,8 @@ def feishu_events():
                 sec = int(m.group(1))
                 CONFIG["SCHEDULE"]["interval_seconds"] = max(10, sec)
                 _send_text(chat_id, f"已更新间隔为 {CONFIG['SCHEDULE']['interval_seconds']} 秒")
-                print(f"[REPLY] interval -> {CONFIG['SCHEDULE']['interval_seconds']}")
             except Exception:
                 _send_text(chat_id, "格式错误，示例：间隔=3600")
-        else:
-            print("[REPLY] ignore non-command")
 
     return jsonify({"code": 0})
 
