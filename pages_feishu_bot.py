@@ -1,22 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-Feishu 群机器人 + Facebook Page(粉丝页/主页) 监控（Render 版，多租户）
+Feishu 群机器人 + Facebook Page(粉丝页/主页) 监控（Render 版，多租户，低精度生产版）
 - 事件入口：/feishu/<tenant>/events
 - 配置来源：TENANTS_JSON（必须，且键名统一大写）
 - 群里 @机器人：执行/开始/暂停/中止/抢占执行/间隔=3600/状态/chatid/帮助
 - 支持：自动轮询 + 手动触发并存；去重；超时；可中止；本轮结束补跑手动
-- 写 result 文件：仅三态 OK / UNPUBLISHED / NOT_FOUND（年龄墙/国家墙按 OK 写入）
+- 写 result 文件：仅三态 OK / UNPUBLISHED / NOT_FOUND
 - “运行异常/权限类”：NEED_TOKEN/AUTH_ERROR/RATE_LIMIT/UNKNOWN/NETWORK_ERROR/TIMEOUT/CANCELLED/WORKER_ERROR
   在飞书推送中单独分区展示
 - 推送分组：按 (Owner, Status) 分组，每组输出 owner|status|count + page_id 列表
 
-✅ 重点修复（你之前踩过的坑）：
-1) 配置键统一大写：APP_ID/APP_SECRET/VERIFICATION_TOKEN/DEFAULT_CHAT_ID 等
+✅ 重点修复：
+1) 配置键统一大写：APP_ID/APP_SECRET/VERIFICATION_TOKEN/DEFAULT_CHAT_ID
 2) @ 机器人文本解析：清理 <at> / @_user_x，避免“未知指令”
 3) 多租户隔离：每个 tenant 独立锁、事件去重缓存、token cache、轮询线程、状态
+4) 低精度版：每个 Page 仅 1 次 Graph 请求（不探测 settings/feed）
 """
 
-import os, re, json, time, threading, traceback
+import os
+import re
+import json
+import time
+import threading
+import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Tuple, Optional
@@ -50,15 +56,16 @@ if not isinstance(TENANTS, dict) or not TENANTS:
     raise RuntimeError("TENANTS_JSON must be a non-empty JSON object (dict)")
 
 # ==========================================================
-# 全局常量（与你原逻辑一致）
+# 状态分组常量（与你原逻辑一致）
 # ==========================================================
 CERTAIN_ABNORMAL = {"UNPUBLISHED", "NOT_FOUND"}
-TECH_EXCEPTIONS  = {"NEED_TOKEN", "AUTH_ERROR", "RATE_LIMIT", "UNKNOWN",
-                    "NETWORK_ERROR", "TIMEOUT", "CANCELLED", "WORKER_ERROR"}
-IGNORED_STATUSES = {"RESTRICTED_AGE", "RESTRICTED_COUNTRY"}
+TECH_EXCEPTIONS = {
+    "NEED_TOKEN", "AUTH_ERROR", "RATE_LIMIT", "UNKNOWN",
+    "NETWORK_ERROR", "TIMEOUT", "CANCELLED", "WORKER_ERROR"
+}
 RESULT_KEEP_STATUSES = {"OK", "UNPUBLISHED", "NOT_FOUND"}
 
-# 线程安全：写文件
+# 写文件锁（全局即可）
 file_lock = threading.Lock()
 
 # ==========================================================
@@ -73,10 +80,12 @@ def now_local_str(tz_name: str) -> str:
 
 def _bucket(status: str) -> str:
     s = (status or "").upper()
-    if s in CERTAIN_ABNORMAL:      return "certain_abnormal"
-    if s in TECH_EXCEPTIONS:       return "tech_exception"
-    if s in IGNORED_STATUSES:      return "ignored"
-    if s in RESULT_KEEP_STATUSES:  return "tri_state"
+    if s in CERTAIN_ABNORMAL:
+        return "certain_abnormal"
+    if s in TECH_EXCEPTIONS:
+        return "tech_exception"
+    if s in RESULT_KEEP_STATUSES:
+        return "tri_state"
     return "other"
 
 def _fmt_label_id(r: Dict[str, Any]) -> str:
@@ -87,7 +96,7 @@ def _fmt_label_id(r: Dict[str, Any]) -> str:
 AT_RE = re.compile(r"<at[^>]*?>.*?</at>", re.I | re.S)
 
 def clean_text(s: str) -> str:
-    """✅ 修复 @ 机器人导致的未知指令：清理 <at> 和 @_user_x"""
+    """清理 @ 机器人带来的噪音：<at>、@_user_x、零宽字符、多空格"""
     if not s:
         return ""
     s = AT_RE.sub("", s)
@@ -116,7 +125,7 @@ def _feishu_base(domain: str) -> str:
     return "https://open.feishu.cn" if (domain or "feishu") == "feishu" else "https://open.larksuite.com"
 
 # ==========================================================
-# 配置校验（大写键）
+# 配置校验 & 默认值（统一大写键）
 # ==========================================================
 def _validate_tenants():
     for tenant, cfg in TENANTS.items():
@@ -128,24 +137,22 @@ def _validate_tenants():
 
         if not isinstance(feishu, dict):
             raise RuntimeError(f"{tenant} missing FEISHU config")
+        if not isinstance(fb, dict):
+            raise RuntimeError(f"{tenant} missing FB config")
 
-        # 飞书必须项（大写）
+        # Feishu 必须项（大写）
         _cfg_required(feishu, "APP_ID", f"{tenant}.FEISHU missing APP_ID")
         _cfg_required(feishu, "APP_SECRET", f"{tenant}.FEISHU missing APP_SECRET")
         _cfg_required(feishu, "VERIFICATION_TOKEN", f"{tenant}.FEISHU missing VERIFICATION_TOKEN")
-        # DEFAULT_CHAT_ID 可选，但建议配置
+        # DEFAULT_CHAT_ID 可选（建议配置）
         if "DEFAULT_CHAT_ID" in feishu and feishu["DEFAULT_CHAT_ID"] in (None, ""):
             raise RuntimeError(f"{tenant}.FEISHU DEFAULT_CHAT_ID is empty")
-
-        # Facebook 配置（允许缺 ACCESS_TOKEN，但会分类 NEED_TOKEN）
-        if not isinstance(fb, dict):
-            raise RuntimeError(f"{tenant} missing FB config")
 
         # FB 必要项
         _cfg_required(fb, "MAPPING_FILE", f"{tenant}.FB missing MAPPING_FILE")
         _cfg_required(fb, "OUT_TXT", f"{tenant}.FB missing OUT_TXT")
 
-        # 兜底默认
+        # Feishu 默认
         feishu.setdefault("TZ", os.getenv("BOT_TZ", "Asia/Shanghai"))
         feishu.setdefault("REQUIRE_AT", os.getenv("FEISHU_REQUIRE_AT", "true").lower() == "true")
         feishu.setdefault("DOMAIN", os.getenv("FEISHU_DOMAIN", "feishu"))
@@ -154,6 +161,7 @@ def _validate_tenants():
         feishu.setdefault("MAX_IDS_PER_GROUP", int(os.getenv("FEISHU_MAX_IDS_PER_GROUP", "200")))
         feishu.setdefault("MAX_GROUPS", int(os.getenv("FEISHU_MAX_GROUPS", "200")))
 
+        # FB 默认
         fb.setdefault("CONCURRENCY", int(os.getenv("FB_CONCURRENCY", "6")))
         fb.setdefault("GRAPH_VERSION", os.getenv("FB_GRAPH_VERSION", "v21.0"))
         fb.setdefault("ACCESS_TOKEN", os.getenv("FB_ACCESS_TOKEN"))
@@ -163,7 +171,8 @@ def _validate_tenants():
         fb.setdefault("BACKOFF_FACTOR", float(os.getenv("FB_BACKOFF_FACTOR", "0.5")))
         fb.setdefault("ROUND_TIMEOUT", int(os.getenv("FB_ROUND_TIMEOUT", "180")))
         fb.setdefault("FUTURE_EXTRA_GRACE", int(os.getenv("FB_FUTURE_EXTRA_GRACE", "2")))
-        fb.setdefault("PROBE_FEED", os.getenv("FB_PROBE_FEED", "true").lower() == "true")
+        # 低精度生产版：固定不探测 feed/settings（避免误开）
+        fb["PROBE_FEED"] = False
 
         sched = cfg.setdefault("SCHEDULE", {})
         if not isinstance(sched, dict):
@@ -282,7 +291,7 @@ def _try_unstick_mutex(tenant: str, force: bool = False) -> bool:
     return False
 
 # ==========================================================
-# Facebook Page 检测逻辑（保留你原逻辑，改为 tenant 参数）
+# Facebook Page 检测（低精度生产版）
 # ==========================================================
 def load_label_id_pairs(path: str) -> List[Tuple[str, str, str]]:
     """
@@ -306,14 +315,14 @@ def load_label_id_pairs(path: str) -> List[Tuple[str, str, str]]:
             m3 = pat3.match(s)
             if m3:
                 label = m3.group(1).strip()
-                pid   = m3.group(2).strip()
+                pid = m3.group(2).strip()
                 owner = m3.group(3).strip()
             else:
                 m2 = pat2.match(s)
                 if not m2:
                     continue
                 label = m2.group(1).strip()
-                pid   = m2.group(2).strip()
+                pid = m2.group(2).strip()
                 owner = "未知"
 
             if pid not in seen:
@@ -333,37 +342,23 @@ def build_session(tenant: str) -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retries, pool_connections=200, pool_maxsize=200)
     sess.mount("https://", adapter)
-    sess.headers.update({"User-Agent": f"fb-page-feishu-bot/tenant-{tenant}/1.3"})
+    sess.headers.update({"User-Agent": f"fb-page-feishu-bot/tenant-{tenant}/low-precision"})
     return sess
 
-def classify_page_status(http_status: int, payload: Optional[Dict[str, Any]],
-                         had_token: bool, need_token_as_normal: bool) -> Tuple[str, int]:
-    if http_status == 200 and isinstance(payload, dict) and payload.get("id"):
-        return "OK", 1
-
-    err = (payload or {}).get("error") if isinstance(payload, dict) else None
-    code = (err or {}).get("code")
-    msg = ((err or {}).get("message") or "").lower() if isinstance(err, dict) else ""
-
-    if code == 803 or "unknown path components" in msg or "do not exist" in msg:
-        return "NOT_FOUND", 0
-    if code in (4, 17) or "limit" in msg:
-        return "RATE_LIMIT", -1
-    if code == 190 or "#10" in msg or "#200" in msg or "permission" in msg or "access token" in msg:
-        if not had_token:
-            return "NEED_TOKEN", (1 if need_token_as_normal else -1)
-        return "AUTH_ERROR", -1
-    if http_status is None:
-        return "NETWORK_ERROR", -1
-    return "UNKNOWN", -1
-
-def probe_page(session: requests.Session, page_id: str, graph_version: str,
-               access_token: Optional[str], timeout: int, probe_feed: bool) -> Dict[str, Any]:
+def probe_page_low_precision(
+    session: requests.Session,
+    page_id: str,
+    graph_version: str,
+    access_token: Optional[str],
+    timeout: int,
+    need_token_as_normal: bool
+) -> Dict[str, Any]:
     """
-    旧业务逻辑（你确认的版本）：
-    - 每个 page 只做 1 次 Graph 请求（提速关键）
-    - 三态用于结果文件：OK / UNPUBLISHED / NOT_FOUND
-    - 运行异常/权限类：AUTH_ERROR（以及可选 NEED_TOKEN/RATE_LIMIT/NETWORK/TIMEOUT）用于飞书异常分区
+    低精度生产版（按你之前业务逻辑）：
+    - 每个 page 仅 1 次请求
+    - 三态写文件：OK / UNPUBLISHED / NOT_FOUND
+    - AUTH_ERROR 视为异常（推送到“运行异常/权限类”）
+    - NEED_TOKEN 是否当异常由 need_token_as_normal 控制
     """
     had_token = bool(access_token)
     base = f"https://graph.facebook.com/{graph_version}/{page_id}"
@@ -378,7 +373,7 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
         except Exception:
             data = {}
 
-        # ========== 1) 200 且有 id：OK / UNPUBLISHED ==========
+        # 成功：OK / UNPUBLISHED
         if resp.status_code == 200 and isinstance(data, dict) and data.get("id"):
             if data.get("is_published") is False:
                 return {
@@ -400,12 +395,12 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
                 "checked_at": now_iso(),
             }
 
-        # ========== 2) 解析 error：区分 NOT_FOUND / AUTH_ERROR ==========
+        # 失败：解析 error
         err = (data or {}).get("error") if isinstance(data, dict) else None
         code = (err or {}).get("code") if isinstance(err, dict) else None
         msg = ((err or {}).get("message") or "").lower() if isinstance(err, dict) else ""
 
-        # --- 2.1 明确不存在：NOT_FOUND（确定异常）---
+        # NOT_FOUND
         if code == 803 or "unknown path components" in msg or "do not exist" in msg:
             return {
                 "page_id": page_id,
@@ -417,33 +412,8 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
                 "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
             }
 
-        # --- 2.2 权限/令牌问题：AUTH_ERROR（你要求算异常）---
-        # 常见：code=190（token/权限）、message 包含 permission / access token / #10 / #200 等
-        if code == 190 or "#10" in msg or "#200" in msg or "permission" in msg or "access token" in msg:
-            # 有 token 仍然报权限/令牌问题 => AUTH_ERROR（异常）
-            if had_token:
-                return {
-                    "page_id": page_id,
-                    "http_status": resp.status_code,
-                    "status": "AUTH_ERROR",
-                    "normal": -1,
-                    "checked_at": now_iso(),
-                    "fb_error_code": code,
-                    "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
-                }
-            # 没 token => NEED_TOKEN（是否当异常由 NEED_TOKEN_AS_NORMAL 控制）
-            return {
-                "page_id": page_id,
-                "http_status": resp.status_code,
-                "status": "NEED_TOKEN",
-                "normal": (1 if CONFIG["FB"]["NEED_TOKEN_AS_NORMAL"] else -1),
-                "checked_at": now_iso(),
-                "fb_error_code": code,
-                "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
-            }
-
-        # --- 2.3 限流（可选是否算异常，按你原脚本：算 tech_exception）---
-        if code in (4, 17) or "limit" in msg or resp.status_code == 429:
+        # RATE_LIMIT
+        if code in (4, 17) or "limit" in msg:
             return {
                 "page_id": page_id,
                 "http_status": resp.status_code,
@@ -454,7 +424,29 @@ def probe_page(session: requests.Session, page_id: str, graph_version: str,
                 "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
             }
 
-        # --- 2.4 其他未知：UNKNOWN（按你原脚本：tech_exception）---
+        # AUTH / TOKEN
+        if code == 190 or "#10" in msg or "#200" in msg or "permission" in msg or "access token" in msg:
+            if had_token:
+                return {
+                    "page_id": page_id,
+                    "http_status": resp.status_code,
+                    "status": "AUTH_ERROR",
+                    "normal": -1,
+                    "checked_at": now_iso(),
+                    "fb_error_code": code,
+                    "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
+                }
+            return {
+                "page_id": page_id,
+                "http_status": resp.status_code,
+                "status": "NEED_TOKEN",
+                "normal": (1 if need_token_as_normal else -1),
+                "checked_at": now_iso(),
+                "fb_error_code": code,
+                "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
+            }
+
+        # 其他：UNKNOWN
         return {
             "page_id": page_id,
             "http_status": resp.status_code,
@@ -520,13 +512,20 @@ def check_pages_one_round(tenant: str):
 
     session = build_session(tenant)
 
-    # page_id -> (label, owner)
     id_to_meta = {pid: (label, owner) for (label, pid, owner) in pairs}
-    results = []
+    results: List[Dict[str, Any]] = []
 
     ex = ThreadPoolExecutor(max_workers=max(1, int(fb["CONCURRENCY"])))
     futs = {
-        ex.submit(probe_page, tenant, session, page_id): page_id
+        ex.submit(
+            probe_page_low_precision,
+            session,
+            page_id,
+            fb["GRAPH_VERSION"],
+            fb.get("ACCESS_TOKEN"),
+            int(fb["REQUEST_TIMEOUT"]),
+            bool(fb["NEED_TOKEN_AS_NORMAL"]),
+        ): page_id
         for (_, page_id, _) in pairs
     }
 
@@ -578,12 +577,13 @@ def check_pages_one_round(tenant: str):
                     r = fut.result()
                 except Exception as e:
                     r = {
-                        "page_id": pid, "status": "WORKER_ERROR", "normal": -1,
-                        "checked_at": now_iso(), "name": None,
+                        "page_id": pid,
+                        "status": "WORKER_ERROR",
+                        "normal": -1,
+                        "checked_at": now_iso(),
                         "fb_error_message": str(e)
                     }
 
-                # 统一加上 label + owner（以 pages.txt 为准）
                 r["label"] = label
                 r["owner_name"] = owner
                 results.append(r)
@@ -593,17 +593,13 @@ def check_pages_one_round(tenant: str):
                     "❌" if _bucket(r.get("status")) == "certain_abnormal" else "⚠️"
                 )
                 nm = f" | {r.get('name')}" if r.get("name") else ""
-                extra = []
-                if r.get("age_restrictions"): extra.append(f"age={r['age_restrictions']}")
-                if r.get("country_restrictions"): extra.append(f"country={r['country_restrictions']}")
-                suffix = f" [{', '.join(extra)}]" if extra else ""
-                print(f"[{now_local_str(tz_name)}] {tag} ({done_idx}/{total}) {label}-{r['page_id']}{nm} -> {r.get('status')}{suffix}")
+                print(f"[{now_local_str(tz_name)}] {tag} ({done_idx}/{total}) {label}-{r['page_id']}{nm} -> {r.get('status')}")
 
     finally:
         ex.shutdown(wait=False, cancel_futures=True)
         try:
             session.close()
-        except:
+        except Exception:
             pass
 
     def _pack_item(row: Dict[str, Any]) -> Dict[str, str]:
@@ -612,30 +608,23 @@ def check_pages_one_round(tenant: str):
         page_id = (row.get("page_id") or "").strip()
         return {"owner": owner, "status": status, "page_id": page_id}
 
-    # 三态写入文件
-    tri_lines = []
+    # 写 result（仅三态）
+    tri_lines: List[str] = []
     for r in results:
         stt = (r.get("status") or "").upper()
         if not r.get("label"):
             continue
-        bucket = _bucket(stt)
-        if bucket == "tri_state":
+        if stt in RESULT_KEEP_STATUSES:
             tri_lines.append(f"{_fmt_label_id(r)} | {stt}")
-        elif bucket == "ignored":
-            tri_lines.append(f"{_fmt_label_id(r)} | OK")
 
     append_unique_lines(fb["OUT_TXT"], tri_lines)
 
-    ok_count = sum(
-        1 for r in results
-        if ((r.get("status") or "").upper() == "OK") or (_bucket(r.get("status")) == "ignored")
-    )
+    ok_count = sum(1 for r in results if (r.get("status") or "").upper() == "OK")
 
     certain_ab_items = [
         _pack_item(r) for r in results
         if r.get("label") and _bucket(r.get("status")) == "certain_abnormal"
     ]
-
     tech_items = [
         _pack_item(r) for r in results
         if r.get("label") and _bucket(r.get("status")) == "tech_exception"
@@ -648,8 +637,7 @@ def check_pages_one_round(tenant: str):
 # ==========================================================
 def _get_tenant_access_token(tenant: str) -> Optional[str]:
     cfg = _get_tenant_cfg(tenant)["FEISHU"]
-    domain = cfg.get("DOMAIN", "feishu")
-    base = _feishu_base(domain)
+    base = _feishu_base(cfg.get("DOMAIN", "feishu"))
 
     st = _st(tenant)
     cache = st["TENANT_TOKEN_CACHE"]
@@ -677,8 +665,7 @@ def _get_tenant_access_token(tenant: str) -> Optional[str]:
 
 def _send_text(tenant: str, chat_id: str, text: str):
     cfg = _get_tenant_cfg(tenant)["FEISHU"]
-    domain = cfg.get("DOMAIN", "feishu")
-    base = _feishu_base(domain)
+    base = _feishu_base(cfg.get("DOMAIN", "feishu"))
 
     token = _get_tenant_access_token(tenant)
     if not token or not chat_id:
@@ -697,7 +684,6 @@ def _target_chat_ids(tenant: str, preferred: Optional[str] = None):
     if preferred:
         return [preferred]
 
-    # 支持 env 覆盖（多 chat id）
     ids_env = os.getenv(f"{tenant}_FEISHU_DEFAULT_CHAT_IDS", "") or os.getenv("FEISHU_DEFAULT_CHAT_IDS", "")
     ids = [x.strip() for x in re.split(r"[,\s;]+", ids_env) if x.strip()]
 
@@ -719,7 +705,7 @@ def _target_chat_ids(tenant: str, preferred: Optional[str] = None):
     return uniq
 
 # ==========================================================
-# 推送：按 (Owner, Status) 分组（保留你原格式）
+# 推送：按 (Owner, Status) 分组
 # ==========================================================
 def _group_owner_status_to_ids(items: list[dict]) -> list[tuple[str, str, list[str]]]:
     from collections import defaultdict
@@ -746,15 +732,20 @@ def _append_group_block(lines: list[str], owner: str, status: str, ids: list[str
     shown = ids[:max_ids]
     lines.extend(shown)
     if len(ids) > max_ids:
-        lines.append(f"... 还有 {len(ids) - max_ids} 个 page_id 未展示（可调 FEISHU_MAX_IDS_PER_GROUP / FEISHU.MAX_IDS_PER_GROUP）")
+        lines.append(f"... 还有 {len(ids) - max_ids} 个 page_id 未展示（可调 FEISHU.MAX_IDS_PER_GROUP）")
     lines.append("")
 
-def push_summary(tenant: str, round_name: str, ok: int, ab_items: list[dict],
-                 chat_id: Optional[str] = None,
-                 started_at: datetime | None = None,
-                 ended_at: datetime | None = None,
-                 duration_sec: int | None = None,
-                 tech_items: list[dict] | None = None):
+def push_summary(
+    tenant: str,
+    round_name: str,
+    ok: int,
+    ab_items: list[dict],
+    chat_id: Optional[str] = None,
+    started_at: Optional[datetime] = None,
+    ended_at: Optional[datetime] = None,
+    duration_sec: Optional[int] = None,
+    tech_items: Optional[list[dict]] = None
+):
     tech_items = tech_items or []
     cfg = _get_tenant_cfg(tenant)["FEISHU"]
 
@@ -784,7 +775,7 @@ def push_summary(tenant: str, round_name: str, ok: int, ab_items: list[dict],
         for (owner, status, ids) in groups[:max_groups]:
             _append_group_block(lines, owner, status, ids, max_ids)
         if len(groups) > max_groups:
-            lines.append(f"... 还有 {len(groups) - max_groups} 个分组未展示（可调 FEISHU_MAX_GROUPS / FEISHU.MAX_GROUPS）")
+            lines.append(f"... 还有 {len(groups) - max_groups} 个分组未展示（可调 FEISHU.MAX_GROUPS）")
             lines.append("")
 
     if tech_items:
@@ -793,7 +784,7 @@ def push_summary(tenant: str, round_name: str, ok: int, ab_items: list[dict],
         for (owner, status, ids) in groups2[:max_groups]:
             _append_group_block(lines, owner, status, ids, max_ids)
         if len(groups2) > max_groups:
-            lines.append(f"... 还有 {len(groups2) - max_groups} 个分组未展示（可调 FEISHU_MAX_GROUPS / FEISHU.MAX_GROUPS）")
+            lines.append(f"... 还有 {len(groups2) - max_groups} 个分组未展示（可调 FEISHU.MAX_GROUPS）")
             lines.append("")
 
     if (not ab_items and not tech_items) and (not bool(cfg.get("PUSH_ON_NO_ABNORMAL", False))):
@@ -808,7 +799,7 @@ def push_summary(tenant: str, round_name: str, ok: int, ab_items: list[dict],
     print(f"[PUSH] tenant={tenant} {round_name}: ok={ok} ab={len(ab_items)} tech={len(tech_items)} to={targets}")
 
 # ==========================================================
-# 执行：互斥锁 + 周期 + 手动补跑（保留你原逻辑）
+# 执行：互斥锁 + 周期 + 手动补跑
 # ==========================================================
 def run_once_with_lock(tenant: str, source: str, chat_id: Optional[str], notify_start: bool = False):
     st = _st(tenant)
@@ -848,8 +839,10 @@ def run_once_with_lock(tenant: str, source: str, chat_id: Optional[str], notify_
         print(f"[RUN] tenant={tenant} end {source}: total={total} ok={ok} ab={len(ab_items)} tech={len(tech_items)} "
               f"start={start_wall.strftime('%Y-%m-%d %H:%M:%S')} end={end_wall.strftime('%Y-%m-%d %H:%M:%S')} cost={duration}s")
 
-        push_summary(tenant, source, ok, ab_items, chat_id=chat_id,
-                     started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_items=tech_items)
+        push_summary(
+            tenant, source, ok, ab_items, chat_id=chat_id,
+            started_at=start_wall, ended_at=end_wall, duration_sec=duration, tech_items=tech_items
+        )
         return True
 
     except Exception as e:
@@ -878,12 +871,12 @@ def _drain_manual(tenant: str):
 
 def monitor_loop(tenant: str):
     st = _st(tenant)
-    cfg = _get_tenant_cfg(tenant)
-    interval = int(cfg["SCHEDULE"]["INTERVAL_SECONDS"])
-
     while st["RUN_FLAG"].is_set():
         run_once_with_lock(tenant, "周期执行", None)
         _drain_manual(tenant)
+
+        # ✅ 每轮读取最新 interval（支持指令动态修改）
+        interval = int(_get_tenant_cfg(tenant)["SCHEDULE"]["INTERVAL_SECONDS"])
 
         for _ in range(interval):
             _try_unstick_mutex(tenant, force=False)
@@ -904,7 +897,7 @@ def _start_monitor_if_needed(tenant: str):
         st["RUN_FLAG"].set()
         threading.Thread(target=monitor_loop, args=(tenant,), daemon=True, name=f"monitor-{tenant}").start()
         st["MONITOR_THREAD_STARTED"] = True
-        print(f"[BOOT] tenant={tenant} 自动轮询已启动（间隔 { _get_tenant_cfg(tenant)['SCHEDULE']['INTERVAL_SECONDS'] }s）")
+        print(f"[BOOT] tenant={tenant} 自动轮询已启动（间隔 {_get_tenant_cfg(tenant)['SCHEDULE']['INTERVAL_SECONDS']}s）")
 
 # 启动时尝试自启
 for t in TENANTS.keys():
@@ -1025,7 +1018,7 @@ def feishu_events(tenant: str):
         print(f"[EVENT] tenant={tenant} no chat_id found, skip")
         return jsonify({"code": 0})
 
-    # 群消息 require_at
+    # require_at
     mentioned = bool(mentions)
     if not mentioned:
         try:
@@ -1043,7 +1036,6 @@ def feishu_events(tenant: str):
     cmd_l = cmd.lower()
     print(f"[EVENT PARSED] tenant={tenant} chat_id={chat_id} text={repr(text)} cmd={repr(cmd)}")
 
-    # 更新 current chat id
     st = _st(tenant)
     st["CURRENT_CHAT_ID"] = chat_id
 
@@ -1141,19 +1133,16 @@ def feishu_events(tenant: str):
                 _send_text(tenant, chat_id, f"已更新间隔为 {_get_tenant_cfg(tenant)['SCHEDULE']['INTERVAL_SECONDS']} 秒")
             except Exception:
                 _send_text(tenant, chat_id, "格式错误，示例：间隔=3600")
+        elif cmd in ("帮助", "help", "?"):
+            _send_text(
+                tenant, chat_id,
+                "支持指令：chatid / 状态 / 执行 / 开始 / 暂停 / 中止 / 抢占执行 / 间隔=3600 / 重置锁"
+            )
         else:
-            # 帮助（你原来没有专门 help，这里补一个，不影响其它）
-            if cmd in ("帮助", "help", "?"):
-                _send_text(
-                    tenant, chat_id,
-                    "支持指令：chatid / 状态 / 执行 / 开始 / 暂停 / 中止 / 抢占执行 / 间隔=3600 / 重置锁"
-                )
-            else:
-                # 不刷屏：不回复也行；如果你希望像之前那样回复未知指令，可取消注释
-                _send_text(
-                    tenant, chat_id,
-                    "❓未知指令\n支持：chatid / 状态 / 执行 / 开始 / 暂停 / 中止 / 抢占执行 / 间隔=3600 / 重置锁"
-                )
+            _send_text(
+                tenant, chat_id,
+                "❓未知指令\n支持：chatid / 状态 / 执行 / 开始 / 暂停 / 中止 / 抢占执行 / 间隔=3600 / 重置锁"
+            )
 
     return jsonify({"code": 0})
 
@@ -1166,7 +1155,6 @@ def ensure_result_file(path: str):
         pass
 
 if __name__ == "__main__":
-    # 确保每个 tenant 的结果文件存在
     for t in TENANTS.keys():
         ensure_result_file(_get_tenant_cfg(t)["FB"]["OUT_TXT"])
     port = int(os.getenv("PORT", "3000"))
