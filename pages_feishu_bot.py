@@ -357,122 +357,140 @@ def classify_page_status(http_status: int, payload: Optional[Dict[str, Any]],
         return "NETWORK_ERROR", -1
     return "UNKNOWN", -1
 
-def probe_page(tenant: str, session: requests.Session, page_id: str) -> Dict[str, Any]:
-    fb = _get_tenant_cfg(tenant)["FB"]
-
-    graph_version = fb["GRAPH_VERSION"]
-    access_token = fb.get("ACCESS_TOKEN")
-    timeout = int(fb["REQUEST_TIMEOUT"])
-    probe_feed = bool(fb["PROBE_FEED"])
-
+def probe_page(session: requests.Session, page_id: str, graph_version: str,
+               access_token: Optional[str], timeout: int, probe_feed: bool) -> Dict[str, Any]:
+    """
+    旧业务逻辑（你确认的版本）：
+    - 每个 page 只做 1 次 Graph 请求（提速关键）
+    - 三态用于结果文件：OK / UNPUBLISHED / NOT_FOUND
+    - 运行异常/权限类：AUTH_ERROR（以及可选 NEED_TOKEN/RATE_LIMIT/NETWORK/TIMEOUT）用于飞书异常分区
+    """
     had_token = bool(access_token)
     base = f"https://graph.facebook.com/{graph_version}/{page_id}"
-    params = {"fields": "id,name,link,is_published,business{name}"}
+    params = {"fields": "id,name,link,is_published"}
     if had_token:
         params["access_token"] = access_token
 
     try:
         resp = session.get(base, params=params, timeout=timeout)
         try:
-            data = resp.json()
+            data = resp.json() if "application/json" in (resp.headers.get("content-type") or "") else {}
         except Exception:
-            data = None
+            data = {}
 
-        age_rest = None
-        country_rest = None
-        settings_perm_err = False
-
-        def _read_settings(token: Optional[str]) -> Tuple[Optional[str], Optional[str], int, Optional[str]]:
-            sparams = {"fields": "setting,value"}
-            if token:
-                sparams["access_token"] = token
-            r = session.get(f"{base}/settings", params=sparams, timeout=timeout)
-            try:
-                js = r.json()
-            except Exception:
-                js = None
-            ar = cr = None
-            if r.status_code == 200 and isinstance(js, dict):
-                for it in (js.get("data") or []):
-                    if it.get("setting") == "AGE_RESTRICTIONS":
-                        ar = it.get("value")
-                    elif it.get("setting") == "COUNTRY_RESTRICTIONS":
-                        cr = it.get("value")
-            emsg = (js or {}).get("error", {}).get("message") if isinstance(js, dict) else None
-            return ar, cr, r.status_code, emsg
-
-        if had_token:
-            ar, cr, sc, em = _read_settings(access_token)
-            if sc == 200:
-                age_rest, country_rest = ar, cr
-            elif em and "Insufficient administrative permission" in em:
-                r2 = session.get(base, params={"fields": "access_token", "access_token": access_token}, timeout=timeout)
-                js2 = r2.json() if "application/json" in (r2.headers.get("content-type") or "") else {}
-                ptoken = (js2 or {}).get("access_token")
-                if ptoken:
-                    ar2, cr2, sc2, _ = _read_settings(ptoken)
-                    if sc2 == 200:
-                        age_rest, country_rest = ar2, cr2
-                    else:
-                        settings_perm_err = True
-                else:
-                    settings_perm_err = True
-
-        status, normal_flag = classify_page_status(resp.status_code, data, had_token, bool(fb["NEED_TOKEN_AS_NORMAL"]))
+        # ========== 1) 200 且有 id：OK / UNPUBLISHED ==========
         if resp.status_code == 200 and isinstance(data, dict) and data.get("id"):
-            is_published = data.get("is_published")
-            if is_published is False:
-                status, normal_flag = "UNPUBLISHED", 0
-            elif country_rest and str(country_rest).strip() not in ("", "None"):
-                status, normal_flag = "RESTRICTED_COUNTRY", 0
-            elif age_rest and str(age_rest).strip().lower() not in ("", "13+"):
-                status, normal_flag = "RESTRICTED_AGE", 0
-            else:
-                status, normal_flag = "OK", 1
-        else:
-            is_published = None
+            if data.get("is_published") is False:
+                return {
+                    "page_id": page_id,
+                    "http_status": resp.status_code,
+                    "status": "UNPUBLISHED",
+                    "normal": 0,
+                    "name": data.get("name"),
+                    "link": data.get("link"),
+                    "checked_at": now_iso(),
+                }
+            return {
+                "page_id": page_id,
+                "http_status": resp.status_code,
+                "status": "OK",
+                "normal": 1,
+                "name": data.get("name"),
+                "link": data.get("link"),
+                "checked_at": now_iso(),
+            }
 
-        feed_hint = None
-        if probe_feed and status in ("OK", "NEED_TOKEN", "AUTH_ERROR", "UNKNOWN", "RATE_LIMIT"):
-            try:
-                feed_params = {"limit": 1}
-                if had_token:
-                    feed_params["access_token"] = access_token
-                rfeed = session.get(f"{base}/feed", params=feed_params, timeout=timeout)
-                dfeed = rfeed.json() if "application/json" in (rfeed.headers.get("content-type") or "") else None
-                if rfeed.status_code != 200:
-                    er = (dfeed or {}).get("error") or {}
-                    emsg2 = (er.get("message") or "").lower()
-                    if any(k in emsg2 for k in ["permissions", "requires", "not authorized", "#10", "#200"]):
-                        feed_hint = "FEED_PERMISSION_BLOCKED"
-                    elif any(k in emsg2 for k in ["country", "age", "restricted"]):
-                        feed_hint = "FEED_GEO_AGE_RESTRICTED"
-            except Exception:
-                pass
-        if settings_perm_err and not feed_hint:
-            feed_hint = "SETTINGS_PERMISSION_BLOCKED"
+        # ========== 2) 解析 error：区分 NOT_FOUND / AUTH_ERROR ==========
+        err = (data or {}).get("error") if isinstance(data, dict) else None
+        code = (err or {}).get("code") if isinstance(err, dict) else None
+        msg = ((err or {}).get("message") or "").lower() if isinstance(err, dict) else ""
 
+        # --- 2.1 明确不存在：NOT_FOUND（确定异常）---
+        if code == 803 or "unknown path components" in msg or "do not exist" in msg:
+            return {
+                "page_id": page_id,
+                "http_status": resp.status_code,
+                "status": "NOT_FOUND",
+                "normal": 0,
+                "checked_at": now_iso(),
+                "fb_error_code": code,
+                "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
+            }
+
+        # --- 2.2 权限/令牌问题：AUTH_ERROR（你要求算异常）---
+        # 常见：code=190（token/权限）、message 包含 permission / access token / #10 / #200 等
+        if code == 190 or "#10" in msg or "#200" in msg or "permission" in msg or "access token" in msg:
+            # 有 token 仍然报权限/令牌问题 => AUTH_ERROR（异常）
+            if had_token:
+                return {
+                    "page_id": page_id,
+                    "http_status": resp.status_code,
+                    "status": "AUTH_ERROR",
+                    "normal": -1,
+                    "checked_at": now_iso(),
+                    "fb_error_code": code,
+                    "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
+                }
+            # 没 token => NEED_TOKEN（是否当异常由 NEED_TOKEN_AS_NORMAL 控制）
+            return {
+                "page_id": page_id,
+                "http_status": resp.status_code,
+                "status": "NEED_TOKEN",
+                "normal": (1 if CONFIG["FB"]["NEED_TOKEN_AS_NORMAL"] else -1),
+                "checked_at": now_iso(),
+                "fb_error_code": code,
+                "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
+            }
+
+        # --- 2.3 限流（可选是否算异常，按你原脚本：算 tech_exception）---
+        if code in (4, 17) or "limit" in msg or resp.status_code == 429:
+            return {
+                "page_id": page_id,
+                "http_status": resp.status_code,
+                "status": "RATE_LIMIT",
+                "normal": -1,
+                "checked_at": now_iso(),
+                "fb_error_code": code,
+                "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
+            }
+
+        # --- 2.4 其他未知：UNKNOWN（按你原脚本：tech_exception）---
         return {
             "page_id": page_id,
             "http_status": resp.status_code,
-            "status": status,
-            "normal": normal_flag,
-            "name": (data or {}).get("name") if isinstance(data, dict) else None,
-            "link": (data or {}).get("link") if isinstance(data, dict) else None,
-            "is_published": is_published,
-            "age_restrictions": age_rest,
-            "country_restrictions": country_rest,
+            "status": "UNKNOWN",
+            "normal": -1,
             "checked_at": now_iso(),
-            "feed_hint": feed_hint,
-            "fb_error_code": (data or {}).get("error", {}).get("code") if isinstance(data, dict) else None,
-            "fb_error_message": (data or {}).get("error", {}).get("message") if isinstance(data, dict) else None,
+            "fb_error_code": code,
+            "fb_error_message": (err or {}).get("message") if isinstance(err, dict) else None,
         }
 
+    except requests.Timeout as e:
+        return {
+            "page_id": page_id,
+            "http_status": None,
+            "status": "TIMEOUT",
+            "normal": -1,
+            "checked_at": now_iso(),
+            "fb_error_message": str(e),
+        }
     except requests.RequestException as e:
         return {
-            "page_id": page_id, "http_status": None, "status": "NETWORK_ERROR", "normal": -1,
-            "name": None, "link": None, "checked_at": now_iso(),
-            "fb_error_code": None, "fb_error_message": str(e), "feed_hint": None,
+            "page_id": page_id,
+            "http_status": None,
+            "status": "NETWORK_ERROR",
+            "normal": -1,
+            "checked_at": now_iso(),
+            "fb_error_message": str(e),
+        }
+    except Exception as e:
+        return {
+            "page_id": page_id,
+            "http_status": None,
+            "status": "UNKNOWN",
+            "normal": -1,
+            "checked_at": now_iso(),
+            "fb_error_message": str(e),
         }
 
 def append_unique_lines(path: str, lines: List[str]):
