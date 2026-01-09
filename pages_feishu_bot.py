@@ -5,6 +5,7 @@ import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 import requests
+import re
 
 # ==========================================================
 # 基础配置
@@ -119,9 +120,23 @@ def normalize_feishu_callback(body: dict):
     return "unknown", None, None
 
 
-def clean_text(text: str):
-    # 去掉换行，多空格收敛（@ 机器人时飞书可能带换行）
-    return (text or "").replace("\n", " ").strip()
+AT_RE = re.compile(r"<at[^>]*>.*?</at>", re.IGNORECASE)
+
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+
+    # 1️⃣ 去掉 <at>...</at>
+    text = AT_RE.sub("", text)
+
+    # 2️⃣ 把可能残留的 @_user_x 去掉
+    text = re.sub(r"@_user_\d+", "", text)
+
+    # 3️⃣ 多空格归一
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
 
 
 # ==========================================================
