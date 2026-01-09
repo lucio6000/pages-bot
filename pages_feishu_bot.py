@@ -172,18 +172,20 @@ def feishu_events(tenant):
     if tenant not in TENANTS:
         return jsonify({"error": "unknown tenant"}), 404
 
-    body = request.json or {}
+    body = request.get_json(silent=True) or {}
     print(f"[FEISHU IN] tenant={tenant} keys={list(body.keys())}", flush=True)
 
-    # 校验 token
+    # ✅ 最稳：先处理 url_verification（不依赖 normalize）
+    if body.get("type") == "url_verification":
+        return jsonify({"challenge": body.get("challenge")})
+
+    # 校验 token（verify 之后再校验更安全）
     token = body.get("token")
     if token and token != TENANTS[tenant]["FEISHU"]["VERIFICATION_TOKEN"]:
         return jsonify({"error": "invalid token"}), 403
 
     kind, event_type, event = normalize_feishu_callback(body)
 
-    if kind == "verify":
-        return jsonify({"challenge": body.get("challenge")})
 
     if kind == "event" and event_type == "im.message.receive_v1":
         msg = event.get("message", {})
